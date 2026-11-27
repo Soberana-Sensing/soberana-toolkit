@@ -1,0 +1,158 @@
+# One datatype, one file. source: where it comes from; processing: how it is computed; output: what the cube holds.
+name: s2_l2a_monthly
+group: optical
+
+aoi:
+  geojson: data/aoi/diattang.geojson
+  # Target CRS for the cube and every output layer. Single source of truth: the pipeline always
+  # reprojects to it before indices, so the grid never drifts. Must be an EPSG code, e.g. 32628
+  # (WGS 84 / UTM zone 28N, metres; Diattang is in this zone). WKT is accepted but EPSG preferred.
+  crs: EPSG:32628
+
+source:
+  kind: openeo
+  provider: Copernicus Data Space Ecosystem, via openEO
+  collection: SENTINEL2_L2A
+  citation: openEO collection SENTINEL2_L2A
+  roles: {blue: B02, green: B03, red: B04, re1: B05, nir: B08, nir_narrow: B8A, swir1: B11, swir2: B12}
+  scale: 0.0001
+  time_start: "2016-01-01"
+  time_end: "2025-12-31"
+  max_cloud_cover: 15
+
+processing:
+  mask:
+    scl:
+      # ---- Dilated cloud mask (CDSE process "to_scl_dilation_mask") ----
+      # SCL gives every 20 m pixel a class (4 = vegetation, 8 = cloud, ...). 
+      # This process builds two "bad pixel" masks from those classes and then 
+      # GROWS each one (blur + threshold), so the fuzzy edges of clouds, thin haze 
+      # and shadows next to clouds are removed too.
+      # Final mask = mask A OR mask B. Kernel sizes are in SCL pixels (20 m).
+      # If this block is present it is used; it is the only masking path the pipeline supports.
+      # Process defaults: erosion 0, kernel1 17, kernel2 201, mask1/mask2 values as below.
+      # Trade-off: bigger kernels = cleaner images but fewer valid observations per month.
+      dilation:
+        erosion_kernel_size: 3           # NOT default (0 = off). Step 0: shrink the flagged pixels by ~3 px so tiny isolated
+                                         #   spots (SCL speckle, single wrongly flagged pixels) vanish BEFORE growing.
+                                         #   Larger = kills bigger false-positive blobs, but can also erase thin real clouds.
+        mask1_values: [2, 4, 5, 6, 7]    # Mask A, default. Classes treated as GOOD: dark area, vegetation, bare soil,
+                                         #   water, unclassified. EVERYTHING ELSE (no data, saturated, shadow, clouds,
+                                         #   cirrus, snow) is bad for mask A.
+        kernel1_size: 17                 # Mask A growth, default. Small buffer around those bad pixels
+                                         #   (~4-5 px = ~90 m beyond the edge, my estimate). Cleans up cloud edges.
+        mask2_values: [3, 8, 9, 10, 11]  # Mask B, default. Classes treated as BAD and grown widely: cloud shadow,
+                                         #   cloud medium prob., cloud high prob., thin cirrus, snow/ice.
+                                         #   Remove 11 to keep snow.
+        kernel2_size: 77                 # NOT default (201). Mask B growth: wide buffer, because shadows fall far from their cloud.
+                                         #   77 = ~25 px = ~500 m beyond the edge, 201 = ~66 px = ~1.3 km (my estimates).
+                                         #   Lower if you lose too much data, raise if shadows/haze remain.
+  # Spatial options. Masking runs first on the native grid,
+  # then these run on the scaled bands.
+  # CDSE already puts the 10/20 m bands on one common grid,
+  # so resampling is optional. Reprojection to aoi.crs is not optional and always happens.
+
+  spatial:
+    # clip_to_aoi: false          # mask_polygon: pixels outside the aoi.geojson polygon become nodata
+    # resample:
+    #   resolution: 20            # target pixel size in target-CRS units (m for UTM); 0 = keep native
+    #   method: bilinear          # bands: near | bilinear | cubic | cubicspline | lanczos | average | mode | max | min | med | q1 | q3 | rms | sum
+    #   scl_method: near          # same choices, used for the scl_classes layers
+    #   align: upper-left         # upper-left | upper-right | lower-left | lower-right
+    
+    # aggregate_window:           # experimental openEO process, runs AFTER temporal aggregation; check backend support
+    #   size: [3, 3]              # window in pixels [x, y] of the (resampled) grid
+    #   reducer: mean             # same reducer names as temporal
+    #   boundary: pad             # pad | trim
+    #   align: upper-left
+ 
+  temporal:
+    aggregate:
+      period: month               # hour | day | week | dekad | month | season | tropical-season | year | decade | decade-ad
+      reducer: median             # mean | median | min | max | sum | sd | variance | first | last | count | product
+      
+      # Custom intervals instead of period (left-closed, end exclusive; intervals takes precedence over period):
+      # intervals: [["2024-01-01", "2024-04-01"], ["2024-04-01", "2024-07-01"]]
+      # labels: ["2024-Q1", "2024-Q2"]
+    # gap_fill: linear            # only "linear" is accepted; any other value raises. Leading/trailing gaps stay nodata
+ 
+scl_classes:                      # exported as fraction (0-1) of clear observations per period
+  scl_water: 6
+  scl_vegetation: 4
+  scl_soil: 5                     # a list also works, e.g. scl_cloudy: [8, 9, 10] (cloud classes are masked, so they will be 0)
+ 
+indices:
+  SI1:
+    formula: sqrt(green * red)
+    source: Douaoui et al. 2006, Table 1 (Salinity Index 1)
+    description: 'Soil index 1 (Douaoui 2006): geometric mean of green and red reflectance. Higher: bright visible surface, typically bare salt-affected soil or salt crust. Lower: dark surfaces, vegetation, water.'
+  SI2:
+    formula: sqrt(green ** 2 + red ** 2 + nir ** 2)
+    source: Douaoui et al. 2006, Table 1 (SI2)
+    description: 'Soil index 2 (Douaoui 2006): root of the sum of squared green, red and NIR reflectance. Higher: bright surface across all three bands, such as salt crust or dry bare soil. Lower: dark surfaces such as water or wet soil.'
+  SI3:
+    formula: sqrt(green ** 2 + red ** 2)
+    source: Douaoui et al. 2006, Table 1 (SI3)
+    description: 'Soil index 3 (Douaoui 2006): root of the sum of squared green and red reflectance. Higher: bright visible surface, such as salt crust or bare dry soil. Lower: dark surfaces such as water, wet soil or vegetation.'
+  CRSI:
+    formula: sqrt_clip(safe_div(nir * red - green * blue, nir * red + green * blue))
+    source: Scudiero et al. 2015, Eq. 1 (verify against original; not in supplied corpus)
+    description: 'Canopy Response Salinity Index: normalised ratio of NIR x red to green x blue, square-rooted. Higher: vigorous canopy; CRSI is used as a salinity indicator and was the strongest single feature for retrieving soil salinity in the Yellow River Delta <paper_cite paper_id="w:94a8e301-4cce-42f5-af37-b3a213140e6c" quote="The results showed that the CRSI index made the greatest contribution in retrieving soil salinity in this region." section="Abstract" sid="S206" />. Lower: stressed or bare ground, salt crust, water. Clipped to 0 where the ratio is negative, so 0 means no canopy signal, not a missing value.'
+  BSI:
+    formula: safe_div((swir1 + red) - (nir + blue), (swir1 + red) + (nir + blue))
+    source: Rikimaru et al. 2002 (Bare Soil Index, FCD model); formula to confirm against original
+    description: 'Bare soil index (Rikimaru 2002): combines blue, red, NIR and SWIR to capture soil variation <paper_cite paper_id="w:065bd28d-c225-49b6-bb6d-f52dc30233de" quote="Weak liquid absorption at 1.24 μm is present." section="Methods" sid="S10" />. SWIR and red quantify soil mineral composition; blue and NIR enhance vegetation <paper_cite paper_id="w:065bd28d-c225-49b6-bb6d-f52dc30233de" quote="As a result, NDWI is sensitive to changes in liquid water content of vegetation canopies." section="Methods" sid="S12" />. Higher: bare soil. Lower: vegetation and water. Formula still to confirm against the original.'
+  NDVI:
+    formula: safe_div(nir - red, nir + red)
+    source: Rouse et al. 1974
+    description: 'Normalised difference vegetation index (Rouse 1974): (NIR - red) / (NIR + red). Higher: dense, green vegetation, around 0.6 to 0.9. Lower: bare soil near 0, water and cloud below 0. Values outside -1 to 1 are not physical and flag bad input.'
+  SAVI:
+    formula: 1.5 * safe_div(nir - red, nir + red + 0.5)
+    source: Huete 1988, L = 0.5
+    description: 'Soil-adjusted vegetation index (Huete 1988, L = 0.5): NDVI with a soil-brightness correction. Higher: dense vegetation. Lower: bare soil near 0, water below 0.'
+  MSAVI2:
+    formula: safe_div(2 * nir + 1 - sqrt((2 * nir + 1) ** 2 - 8 * (nir - red)), 2)
+    source: Qi et al. 1994, Eq. 3
+    description: 'Modified soil-adjusted vegetation index (Qi 1994): self-adjusting soil correction, for sparse vegetation. Higher: more green cover. Lower: bare soil, water.'
+  WDVI:
+    formula: nir - 1.0 * red
+    source: Clevers 1989; soil-line slope a = 1.0 is a placeholder, fit it on bare AOI pixels
+    description: 'Weighted difference vegetation index (Clevers 1989): NIR - a x red, with a = 1.0 as a placeholder. Higher: more vegetation (NIR high, red low). Lower: bare soil and water. Not bounded to -1 to 1, so compare values only within this dataset.'
+  NDWI:
+    formula: safe_div(green - nir, green + nir)
+    source: McFeeters 1996 (green-NIR form). NOTE. Gao 1996 defines a different NDWI on NIR-SWIR.
+    description: 'Normalised difference water index (McFeeters 1996): (green - NIR) / (green + NIR). Higher: open water and wet surfaces. Lower: vegetation and dry soil. Do not confuse with Gao 1996 NDWI, which is (0.86 um - 1.24 um)/(0.86 um + 1.24 um) and measures canopy liquid water <paper_cite paper_id="w:065bd28d-c225-49b6-bb6d-f52dc30233de" quote="NDWI is defined as (ϱ(0.86 μm) − ϱ(1.24 μ m )) (ϱ(0.86 μ m ) + ϱ(1.24 μ m )) , where ϱ represents the radiance in reflectance units." section="Abstract" sid="S6" />.'
+  MNDWI:
+    formula: safe_div(green - swir1, green + swir1)
+    source: Xu 2006
+    description: 'Modified NDWI (Xu 2006): (green - SWIR1) / (green + SWIR1). Higher: open water, with built-up areas suppressed. Lower: built-up, vegetation and bare soil.'
+  NDMI:
+    formula: safe_div(nir - swir1, nir + swir1)
+    source: Wilson & Sader 2002.
+    description: 'Normalised difference moisture index: (NIR - SWIR) / (NIR + SWIR). Higher: wetter canopy and soil. NDMI tracks seasonal water supply in maize and correlates with soil moisture (R2 = 0.62) <paper_cite paper_id="w:afa5ff0d-beb7-467c-bbe0-56666bb774bb" quote="Additionally, there was a moderately strong negative correlation between NDMI and soil moisture content, and the coefficient of determination was 0.62." section="Abstract" sid="S92" />, and combined with meteorological variables it estimates live fuel moisture content in Mediterranean shrubland <paper_cite paper_id="w:a92c8ca2-d43c-4ebc-a392-3f36d96e1312" quote="This study demonstrates that the Normalized Difference Moisture Index (NDMI) extracted from Sentinel-2 images and meteorological variables (mean surface temperature and mean wind speed) are a promising combination to derive cost-effective LFMC estimation models." section="Abstract" sid="S198" />.'
+  NDRE:
+    formula: safe_div(nir_narrow - re1, nir_narrow + re1)
+    source: Barnes et al. 2000 (red-edge, Sentinel-2 only).
+    description: 'Normalised difference red-edge index (Barnes 2000): (NIR narrow - red edge) / (NIR narrow + red edge). Higher: dense, chlorophyll-rich canopy. Lower: sparse vegetation, bare soil, water. Sentinel-2 only.'
+  SRCI:
+    formula: safe_div(swir1, red)
+    source: Simple Ratio Clay Index (SRCI); formula to confirm against the original definition
+    description: 'Simple Ratio Clay Index: SWIR1 over red, targeting the clay-mineral hydroxyl absorption near 2200 nm. Higher: more clay. Lower: sandier or more organic surfaces. Reported clay-index models are weak on their own (R2 0.40-0.42 for SRCI and NDCI over Landsat-OLI in Indonesia) <paper_cite paper_id="w:f2cf4d4b-83e9-4d9c-b4f5-dc21d5efbd77" quote="The models built from the four spectral index images (i.e., TM&amp;#95;SI, OLI&amp;#95;SI, AST&amp;#95;SI, and S2A&amp;#95;SI) performed poorly (0.43 ≤ R 2 val ≤ 0.51, 126.42 ≤ RMSEP ≤ 140.24 g/kg, 99.65 ≤ MAEP ≤ 112.29 g/kg, 1.34 ≤ RPD ≤ 1.45, and 2.14 ≤ RPIQ ≤ 2.30, respectively; Table 6), and this could be explained by the lack of spectral information.These prediction accuracy results were in agreement with those obtained by [23], who used a Simple Ratio Clay Index (SRCI) and a Normalized Difference Clay Index (NDCI) based on Landsat-OLI imagery for clay content mapping in Indonesia.Accuracy assessment of the regression models based on independent validation showed that both clay indexes provided low performances, with R 2 values of 0.42 and 0.40, respectively [23]; however, [24] used Simple Linear Regression (SLR) to establish the relationships between many NDCI-Landsat TM and clay content over the Kairouan plain in Tunisia and obtained results with R 2 values that varied between 0.48 and 0.73." section="Results" sid="S2" />, so treat as a screening covariate, not a calibrated clay map.'
+  NDCI:
+    formula: safe_div(swir1 - red, swir1 + red)
+    source: Normalized Difference Clay Index (NDCI); formula to confirm against the original definition
+    description: 'Normalized Difference Clay Index: (SWIR1 - red) / (SWIR1 + red). Higher: more clay. Lower: sandier surfaces. NDCI-Landsat TM against clay over the Kairouan plain, Tunisia, gave R2 between 0.48 and 0.73 <paper_cite paper_id="w:f2cf4d4b-83e9-4d9c-b4f5-dc21d5efbd77" quote="The models built from the four spectral index images (i.e., TM&amp;#95;SI, OLI&amp;#95;SI, AST&amp;#95;SI, and S2A&amp;#95;SI) performed poorly (0.43 ≤ R 2 val ≤ 0.51, 126.42 ≤ RMSEP ≤ 140.24 g/kg, 99.65 ≤ MAEP ≤ 112.29 g/kg, 1.34 ≤ RPD ≤ 1.45, and 2.14 ≤ RPIQ ≤ 2.30, respectively; Table 6), and this could be explained by the lack of spectral information.These prediction accuracy results were in agreement with those obtained by [23], who used a Simple Ratio Clay Index (SRCI) and a Normalized Difference Clay Index (NDCI) based on Landsat-OLI imagery for clay content mapping in Indonesia.Accuracy assessment of the regression models based on independent validation showed that both clay indexes provided low performances, with R 2 values of 0.42 and 0.40, respectively [23]; however, [24] used Simple Linear Regression (SLR) to establish the relationships between many NDCI-Landsat TM and clay content over the Kairouan plain in Tunisia and obtained results with R 2 values that varied between 0.48 and 0.73." section="Results" sid="S2" />, so performance is site-dependent.'
+
+output:
+  # All indices defined above (only those listed in bands are computed and saved):
+  bands: [SI1, SI2, SI3, CRSI, BSI, NDVI, SAVI, MSAVI2, WDVI, NDWI, MNDWI, NDMI, NDRE, SRCI, NDCI, scl_water, scl_vegetation, scl_soil]
+  n_valid: true               # adds a layer with the number of valid (unmasked) observations per period
+  format: NetCDF              # NetCDF keeps the time dimension; GTiff for single slices (see conn.list_file_formats())
+  # options: {}               # passed to save_result(options=...), backend-specific (e.g. GTiff tile_grid, filename_prefix)
+  # CRS: every layer is reprojected to aoi.crs. NetCDF carries the grid CRS natively; the same CRS,
+  # the config and the job id are written to <dir>/run_metadata.json next to the output.
+  dir: data/derived/s2_l2a_monthly
+  job_options:                # Kubernetes resources for --run only; ignored when only the graph is built.
+    driver-memory: 4G         #   driver holds the process graph and orchestrates; 4G is generous headroom
+    executor-memory: 3G       #   executor does the pixel work; 3G fits multiple 20 m tiles
+    executor-memoryOverhead: 2G  # JVM/Python overhead on top of executor-memory; raise if jobs die on OOM
