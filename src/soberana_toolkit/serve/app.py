@@ -9,7 +9,8 @@ import streamlit as st
 import xarray as xr
 
 from soberana_toolkit.serve.catalog import (
-    discover_products,
+    discover_dataset_variables,
+    discover_datasets,
     find_scene_count_product,
     find_valid_count_product,
     matching_count_slice,
@@ -26,24 +27,29 @@ if not data_root.is_dir():
     st.error(f"Derived-data directory not found: {data_root}. Run this app from the repository root.")
     st.stop()
 
-products = discover_products(data_root)
-if not products:
+datasets = discover_datasets(data_root)
+if not datasets:
     st.info(f"No NetCDF products found under {data_root}.")
     st.stop()
 
-selected_path = st.sidebar.selectbox(
+selected_dataset = st.sidebar.selectbox(
     "Product",
-    products,
-    format_func=lambda path: str(path.relative_to(data_root)),
+    datasets,
+    format_func=lambda path: path.name,
 )
+variable_files = discover_dataset_variables(selected_dataset)
+if not variable_files:
+    st.error(f"No spatial variables found in {selected_dataset}.")
+    st.stop()
+variables = sorted(variable_files)
+variable = st.sidebar.selectbox("Variable", variables)
+selected_path = variable_files[variable]
 
 with xr.open_dataset(selected_path, decode_coords="all") as dataset:
-    variables = spatial_variables(dataset)
-    if not variables:
-        st.error("This file has no raster variables with one-dimensional x/y coordinates.")
+    if variable not in spatial_variables(dataset):
+        st.error(f"{selected_path}: selected variable {variable!r} is not a spatial raster.")
         st.stop()
 
-    variable = st.sidebar.selectbox("Variable", variables)
     data = dataset[variable]
     axes = spatial_coordinates(data)
     if axes is None:
@@ -108,7 +114,7 @@ with xr.open_dataset(selected_path, decode_coords="all") as dataset:
     crs = dataset.rio.crs
 
 st.subheader(variable)
-st.caption(f"{selected_path.relative_to(data_root)} · {time_label}")
+st.caption(f"{selected_dataset.name} · {time_label}")
 if description:
     with st.expander("Description"):
         st.text(description)
@@ -185,7 +191,7 @@ if valid_count_data is not None:
             st.warning(f"No valid-observation counts are available for {time_label}.")
 
 with st.expander("Metadata"):
-    st.text(f"File: {selected_path}")
+    st.text(f"Dataset: {selected_dataset.name}")
     st.text(f"Dimensions: {', '.join(data.dims)}")
     st.text(f"CRS: {crs or 'not recorded'}")
     st.text(f"Units: {units or 'not recorded'}")

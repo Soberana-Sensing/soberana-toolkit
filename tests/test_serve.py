@@ -3,6 +3,8 @@ import pytest
 import xarray as xr
 
 from soberana_toolkit.serve.catalog import (
+    discover_dataset_variables,
+    discover_datasets,
     discover_products,
     find_scene_count_product,
     find_valid_count_product,
@@ -25,6 +27,32 @@ def test_discover_products_recursively_and_in_order(tmp_path):
         "nested/a.nc",
         "z.nc",
     ]
+
+
+def test_discover_datasets_groups_products_by_parent_directory(tmp_path):
+    root = tmp_path / "derived"
+    (root / "s2_l2a_monthly").mkdir(parents=True)
+    (root / "dem").mkdir()
+    (root / "s2_l2a_monthly" / "BSI.nc").touch()
+    (root / "s2_l2a_monthly" / "NDVI.nc").touch()
+    (root / "dem" / "elevation.nc").touch()
+
+    assert [path.name for path in discover_datasets(root)] == ["dem", "s2_l2a_monthly"]
+
+
+def test_discover_dataset_variables_maps_names_to_files(tmp_path):
+    dataset_dir = tmp_path / "s2_l2a_monthly"
+    dataset_dir.mkdir()
+    for name in ("BSI", "NDVI"):
+        xr.Dataset(
+            {name: (("y", "x"), np.ones((2, 2)))},
+            coords={"y": [2, 1], "x": [1, 2]},
+        ).to_netcdf(dataset_dir / f"{name}.nc")
+
+    assert discover_dataset_variables(dataset_dir) == {
+        "BSI": dataset_dir / "BSI.nc",
+        "NDVI": dataset_dir / "NDVI.nc",
+    }
 
 
 def test_spatial_variables_include_static_and_time_series_rasters():

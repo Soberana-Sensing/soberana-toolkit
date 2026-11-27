@@ -125,11 +125,12 @@ python -m pip install -e "/path/to/soberana-toolkit[serve]"
 python -m streamlit run "/path/to/soberana-toolkit/src/soberana_toolkit/serve/app.py"
 ```
 
-The browser lists `.nc` files anywhere under the consuming project's `data/derived/`, displays
-spatial variables, and provides a time selector for time-series rasters. Static rasters are shown
-without a time selector. For temporal products, it shows the selected month's source-observation
-count and a map of valid observations per pixel when sibling `n_images.nc` and `n_valid.nc` files
-exist. It reads existing products; it does not run processing.
+The browser groups `.nc` files under `data/derived/` by their parent dataset directory. Choose the
+dataset (for example, `s2_l2a_monthly`) as the product, then choose a raster variable. It provides
+a time selector for time-series rasters; static rasters need no time selection. For temporal
+products, it shows the selected month's source-observation count and a map of valid observations
+per pixel when sibling `n_images.nc` and `n_valid.nc` files exist. It reads existing products; it
+does not run processing.
 
 ## Contributing
 
