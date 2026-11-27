@@ -28,3 +28,13 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+# Pylance reads this block too; it needs the interpreter when the venv name is not
+# one of the auto-detected ones (.venv, venv, env).
+[tool.pyright]
+venvPath = "."
+venv = "soberana-toolkit-venv"
+include = ["src", "scripts", "tests"]
+# openeo ships py.typed and re-exports `connect` without the `as` form, so type
+# checkers treat it as private. Library-side issue, not ours.
+reportPrivateImportUsage = "none"
