@@ -86,6 +86,11 @@ The pipeline writes the grid name and a hash of the grid file into `run_metadata
 output can always be traced to the definition that produced it. The dataset YAML is the source
 of truth; there is no separate inventory to keep in sync.
 
+Temporal composites produce two count outputs by default: `n_images.nc` records the number of
+source observations selected for each period before per-pixel masking, and `n_valid.nc` records how
+many unmasked observations contributed at each pixel. Set `output.n_valid: false` to omit the
+per-pixel count; the monthly source-observation count remains available.
+
 ## Data and dates
 
 Consuming projects keep data under `data/`; large data files are not tracked. Any dataset config
@@ -120,9 +125,20 @@ python -m pip install -e "/path/to/soberana-toolkit[serve]"
 python -m streamlit run "/path/to/soberana-toolkit/src/soberana_toolkit/serve/app.py"
 ```
 
-The browser lists `.nc` files anywhere under the consuming project's `data/derived/`, displays
-spatial variables, and provides a time selector for time-series rasters. Static rasters are shown
-without a time selector. It reads existing products; it does not run processing.
+The browser groups `.nc` files under `data/derived/` by their parent dataset directory. Choose the
+dataset (for example, `s2_l2a_monthly`) as the product, then choose a raster variable. It provides
+a time selector for time-series rasters; static rasters need no time selection. For temporal
+products, it shows the selected month's source-observation count and a map of valid observations
+per pixel when sibling `n_images.nc` and `n_valid.nc` files exist. It also shows a variable
+histogram for the selected month and a monthly time series split by water, soil, and vegetation
+SCL fractions. Pixels contribute fractionally to each class instead of being assigned a hard class.
+The time series uses fraction-weighted medians to reduce sensitivity to isolated extreme values.
+Histograms show the 1st-to-99th-percentile range, with more extreme values retained in the outer
+bins so they do not stretch the entire plot. Dataset discovery reads NetCDF metadata, not raster
+arrays. The map and histogram read the selected month's slices; the time series streams the
+selected variable and its SCL fractions month by month, then caches its medians. Changing month
+reuses that time series and computes only the selected month's histogram. It reads existing
+products; it does not run processing.
 
 ## Contributing
 
