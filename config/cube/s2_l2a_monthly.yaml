@@ -2,12 +2,11 @@
 name: s2_l2a_monthly
 group: optical
 
+# CRS, pixel size and alignment all come from this grid. Do not restate them here.
+grid: utm28_30m
+
 aoi:
   geojson: data/aoi/diattang.geojson
-  # Target CRS for the cube and every output layer. Single source of truth: the pipeline always
-  # reprojects to it before indices, so the grid never drifts. Must be an EPSG code, e.g. 32628
-  # (WGS 84 / UTM zone 28N, metres; Diattang is in this zone). WKT is accepted but EPSG preferred.
-  crs: EPSG:32628
 
 source:
   kind: openeo
@@ -49,16 +48,15 @@ processing:
                                          #   Lower if you lose too much data, raise if shadows/haze remain.
   # Spatial options. Masking runs first on the native grid,
   # then these run on the scaled bands.
-  # CDSE already puts the 10/20 m bands on one common grid,
-  # so resampling is optional. Reprojection to aoi.crs is not optional and always happens.
+  # CDSE already puts the 10/20 m bands on one common grid.
+  # Reprojection to the grid CRS and resolution always happens; only the resampling method is a
+  # datatype choice. Resolution and alignment come from config/grids/<grid>.yaml.
 
   spatial:
     # clip_to_aoi: false          # mask_polygon: pixels outside the aoi.geojson polygon become nodata
     # resample:
-    #   resolution: 20            # target pixel size in target-CRS units (m for UTM); 0 = keep native
     #   method: bilinear          # bands: near | bilinear | cubic | cubicspline | lanczos | average | mode | max | min | med | q1 | q3 | rms | sum
     #   scl_method: near          # same choices, used for the scl_classes layers
-    #   align: upper-left         # upper-left | upper-right | lower-left | lower-right
     
     # aggregate_window:           # experimental openEO process, runs AFTER temporal aggregation; check backend support
     #   size: [3, 3]              # window in pixels [x, y] of the (resampled) grid
@@ -149,8 +147,8 @@ output:
   n_valid: true               # adds a layer with the number of valid (unmasked) observations per period
   format: NetCDF              # NetCDF keeps the time dimension; GTiff for single slices (see conn.list_file_formats())
   # options: {}               # passed to save_result(options=...), backend-specific (e.g. GTiff tile_grid, filename_prefix)
-  # CRS: every layer is reprojected to aoi.crs. NetCDF carries the grid CRS natively; the same CRS,
-  # the config and the job id are written to <dir>/run_metadata.json next to the output.
+  # CRS: every layer is reprojected to the grid. NetCDF carries the grid CRS natively; the same CRS,
+  # the grid name and hash, the config and the job id are written to <dir>/run_metadata.json.
   dir: data/derived/s2_l2a_monthly
   job_options:                # Kubernetes resources for --run only; ignored when only the graph is built.
     driver-memory: 4G         #   driver holds the process graph and orchestrates; 4G is generous headroom

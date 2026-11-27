@@ -11,6 +11,11 @@ requires-python = ">=3.10"
 dependencies = [
     "openeo>=0.54",
     "pyyaml>=6",
+    "xarray>=2024.1",
+    "rioxarray>=0.18",
+    "netCDF4>=1.7",
+    "pyproj>=3.6",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]

@@ -5,10 +5,11 @@ Usage:
     python s2_l2a_processing.py cfg.yaml --check    # also list processes the backend does not support
     python s2_l2a_processing.py cfg.yaml --run      # build, run batch job, download results
 
-Pipeline order: load -> SCL mask -> scale -> reproject to aoi.crs -> resample/clip -> indices
+Pipeline order: load -> SCL mask -> scale -> reproject to the grid -> resample/clip -> indices
                 -> temporal aggregation -> gap fill -> spatial window aggregation -> save
 
-Every layer and every output keeps aoi.crs; that CRS is also written to run_metadata.json.
+CRS and resolution come from the named grid in config/grids/; the grid and its hash are
+recorded in run_metadata.json.
 """
 import ast
 import json
@@ -21,12 +22,13 @@ from pathlib import Path
  
 import openeo
 import yaml
+
+from soberana_toolkit.grid import Grid, load_grid
  
 # ---------------------------------------------------------------- allowed values (openEO spec)
 PERIODS = {"hour", "day", "week", "dekad", "month", "season", "tropical-season", "year", "decade", "decade-ad"}
 RESAMPLE_METHODS = {"near", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode",
                     "max", "min", "med", "q1", "q3", "rms", "sum"}
-ALIGN = {"upper-left", "upper-right", "lower-left", "lower-right"}
 REDUCERS = {"mean", "median", "min", "max", "sum", "sd", "variance", "first", "last", "count", "product"}
 GAP_FILL = {"linear"}
  
@@ -108,19 +110,6 @@ def build_mask(cube, scl_cfg: dict):
 
 
 # ---------------------------------------------------------------- spatial / temporal helpers
-def target_crs(aoi: dict):
-    """Target CRS for every layer and output. aoi.crs is the only place it is set."""
-    crs = aoi.get("crs")
-    if not crs:
-        raise KeyError("aoi.crs is required: the CRS the cube and every output layer must keep")
-    if isinstance(crs, str) and crs.upper().startswith("EPSG:"):
-        epsg = crs.split(":", 1)[1]
-        if not epsg.isdigit():
-            raise ValueError(f"aoi.crs '{crs}' is not a valid EPSG code")
-        return int(epsg)
-    return crs  # integer EPSG code or WKT string, passed to the backend as-is
-
-
 def get_aoi(aoi: dict):
     """Return the AOI geometry. The AOI is always a GeoJSON file."""
     if "geojson" not in aoi:
@@ -128,16 +117,17 @@ def get_aoi(aoi: dict):
     return json.loads(Path(aoi["geojson"]).read_text())
 
 
-def apply_spatial(cube, sp: dict, geojson, method_key: str, crs):
-    """Reproject to aoi.crs, optionally resample, then clip to the AOI polygon."""
+def apply_spatial(cube, sp: dict, geojson, method_key: str, grid: Grid):
+    """Reproject to the grid CRS and resolution, then clip to the AOI polygon.
+
+    Resolution and alignment come from the grid so a datatype config cannot contradict them.
+    """
     rs = sp.get("resample") or {}
     default_method = "bilinear" if method_key == "method" else "near"
     method = rs.get(method_key, default_method)
     _check(method, RESAMPLE_METHODS, f"spatial.resample.{method_key}")
-    align = rs.get("align", "upper-left")
-    _check(align, ALIGN, "spatial.resample.align")
-    cube = cube.resample_spatial(resolution=rs.get("resolution", 0), projection=crs,
-                                 method=method, align=align)
+    cube = cube.resample_spatial(resolution=grid.resolution, projection=grid.crs,
+                                 method=method, align=grid.align)
     if sp.get("clip_to_aoi"):
         cube = cube.mask_polygon(geojson)
     return cube
@@ -156,7 +146,7 @@ def temporal_aggregate(cube, agg: dict, reducer: str):
  
  
 # ---------------------------------------------------------------- build
-def build_cube(cfg: dict, conn, crs):
+def build_cube(cfg: dict, conn, grid: Grid):
     src, proc, out = cfg["source"], cfg.get("processing", {}), cfg["output"]
     roles: dict = src["roles"]
     spatial_cfg = proc.get("spatial", {}) or {}
@@ -185,8 +175,8 @@ def build_cube(cfg: dict, conn, crs):
     if mask is not None:
         spectral = spectral.mask(mask)
 
-    # 4. spatial: always reproject to aoi.crs, then optional resample and clip
-    spectral = apply_spatial(spectral, spatial_cfg, geojson, "method", crs)
+    # 4. spatial: always reproject to the grid, then optional resample and clip
+    spectral = apply_spatial(spectral, spatial_cfg, geojson, "method", grid)
 
     # 5. formula environment: role name -> single-band cube
     env = {role: spectral.band(code) for role, code in roles.items()}
@@ -203,7 +193,7 @@ def build_cube(cfg: dict, conn, crs):
         ind = reduce(lambda a, b: a | b, [scl_cube == c for c in classes]) * 1.0
         if mask is not None:
             ind = ind.mask(mask)
-        ind = apply_spatial(ind, spatial_cfg, geojson, "scl_method", crs)
+        ind = apply_spatial(ind, spatial_cfg, geojson, "scl_method", grid)
         scl_layers[name] = ind.rename_labels("bands", [name])
 
     # 7. assemble requested outputs as (name, cube) with a band dimension
@@ -243,7 +233,7 @@ def build_cube(cfg: dict, conn, crs):
  
  
 # ---------------------------------------------------------------- run metadata
-def write_metadata(cfg: dict, out_dir: Path, crs, job_id=None) -> Path:
+def write_metadata(cfg: dict, out_dir: Path, grid: Grid, job_id=None) -> Path:
     """Record what produced this output, including the CRS. The NetCDF carries its own CRS
     from the backend grid; this file is the readable, diffable record next to it."""
     proc = cfg.get("processing") or {}
@@ -252,7 +242,12 @@ def write_metadata(cfg: dict, out_dir: Path, crs, job_id=None) -> Path:
         "collection": cfg["source"]["collection"],
         "provider": cfg["source"].get("provider"),
         "citation": cfg["source"].get("citation"),
-        "crs": f"EPSG:{crs}" if isinstance(crs, int) else crs,
+        "grid": grid.name,
+        "grid_path": str(grid.path),
+        "grid_sha256": grid.sha256(),
+        "crs": grid.crs_label,
+        "resolution": grid.resolution,
+        "resolution_policy": grid.policy,
         "time_start": str(cfg["source"]["time_start"]),
         "time_end": str(cfg["source"]["time_end"]),
         "aoi_geojson": cfg["aoi"]["geojson"],
@@ -288,16 +283,16 @@ def used_processes(node) -> set:
 def main(path: str, run: bool, check: bool):
     cfg = yaml.safe_load(Path(path).read_text())
     cfg["_path"] = path
-    crs = target_crs(cfg["aoi"])
+    grid = load_grid(cfg["grid"])
     conn = openeo.connect(cfg["source"].get("backend_url", "openeo.dataspace.copernicus.eu")).authenticate_oidc()
-    cube = build_cube(cfg, conn, crs)
+    cube = build_cube(cfg, conn, grid)
     result = cube.save_result(format=cfg["output"].get("format", "NetCDF"), options=cfg["output"].get("options"))
 
     out_dir = Path(cfg["output"].get("dir", "out"))
     out_dir.mkdir(parents=True, exist_ok=True)
     graph_json = result.to_json()
     (out_dir / "process_graph.json").write_text(graph_json)
-    print(f"crs: {crs}")
+    print(f"grid: {grid.name} {grid.crs_label} {grid.resolution:g} m ({grid.policy})")
     print(f"process graph written to {out_dir / 'process_graph.json'}")
 
     if check:
@@ -311,7 +306,7 @@ def main(path: str, run: bool, check: bool):
         job.start_and_wait()
         job.get_results().download_files(out_dir)
 
-    meta_path = write_metadata(cfg, out_dir, crs, job_id=getattr(job, "job_id", None))
+    meta_path = write_metadata(cfg, out_dir, grid, job_id=getattr(job, "job_id", None))
     print(f"run metadata written to {meta_path}")
  
  

@@ -27,6 +27,7 @@ data/aoi/*
 !data/.gitkeep
 !data/*/README.md
 !data/*/.gitkeep
+!data/inventory/*.yaml
 
 # Local config and credentials
 config/*.local.*
