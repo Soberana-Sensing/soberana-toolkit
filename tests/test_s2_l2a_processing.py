@@ -3,6 +3,7 @@ import rioxarray  # noqa: F401
 import xarray as xr
 
 from soberana_toolkit.openeo.s2_l2a_processing import (
+    N_IMAGES_DESCRIPTION,
     N_VALID_DESCRIPTION,
     _output_descriptions,
     _requested_output_bands,
@@ -16,8 +17,9 @@ def test_temporal_composites_include_valid_observation_count_by_default():
         "processing": {"temporal": {"aggregate": {"period": "month"}}},
     }
 
-    assert _requested_output_bands(config) == ["NDVI", "n_valid"]
+    assert _requested_output_bands(config) == ["NDVI", "n_valid", "n_images"]
     assert _output_descriptions(config)["n_valid"] == N_VALID_DESCRIPTION
+    assert _output_descriptions(config)["n_images"] == N_IMAGES_DESCRIPTION
 
 
 def test_valid_observation_count_can_be_disabled_or_is_omitted_without_aggregation():
@@ -30,7 +32,7 @@ def test_valid_observation_count_can_be_disabled_or_is_omitted_without_aggregati
         "processing": {},
     }
 
-    assert _requested_output_bands(temporal_config) == ["NDVI"]
+    assert _requested_output_bands(temporal_config) == ["NDVI", "n_images"]
     assert _requested_output_bands(without_aggregation) == ["NDVI"]
 
 

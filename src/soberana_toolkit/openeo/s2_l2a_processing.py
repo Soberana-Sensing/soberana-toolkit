@@ -40,6 +40,9 @@ GAP_FILL = {"linear"}
 N_VALID_DESCRIPTION = (
     "Number of valid input observations contributing to the composite at each pixel."
 )
+N_IMAGES_DESCRIPTION = (
+    "Number of input observations selected for the composite period before per-pixel masking."
+)
  
  
 def _check(value, allowed, label):
@@ -223,10 +226,22 @@ def build_cube(cfg: dict, conn, grid: Grid):
             first = next(iter(roles.values()))
             n = temporal_aggregate(spectral.band(first), agg, "count")
             parts.append(("n_valid", n.add_dimension("bands", "n_valid", type="bands")))
+        if _include_n_images(cfg):
+            scene_cube = cube.filter_bands(["SCL"]).band("SCL")
+            scene_cube = scene_cube.process(
+                "replace_nodata", data=scene_cube, replacement=1
+            )
+            scene_cube = apply_spatial(
+                scene_cube, spatial_cfg, geojson, "scl_method", grid
+            )
+            n = temporal_aggregate(scene_cube, agg, "count")
+            parts.append(("n_images", n.add_dimension("bands", "n_images", type="bands")))
         gap_fill = temporal_cfg.get("gap_fill")
         if gap_fill is not None:
             _check(gap_fill, GAP_FILL, "temporal.gap_fill")
-            parts = [(n, c if n == "n_valid" else c.apply_dimension(dimension="t", process="array_interpolate_linear"))
+            parts = [(n, c if n in {"n_valid", "n_images"} else c.apply_dimension(
+                dimension="t", process="array_interpolate_linear"
+            ))
                      for n, c in parts]
  
     # 9. spatial window aggregation (experimental in openEO)
@@ -264,6 +279,7 @@ def write_metadata(cfg: dict, out_dir: Path, grid: Grid, job_id=None) -> Path:
         "gap_fill": (proc.get("temporal") or {}).get("gap_fill"),
         "bands": cfg["output"]["bands"],
         "n_valid": _include_n_valid(cfg),
+        "n_images": _include_n_images(cfg),
         "format": cfg["output"].get("format", "NetCDF"),
         "config": str(cfg.get("_path", "")) or None,
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -348,7 +364,15 @@ def _requested_output_bands(cfg: dict) -> list[str]:
     bands = list(cfg["output"]["bands"])
     if _include_n_valid(cfg):
         bands.append("n_valid")
+    if _include_n_images(cfg):
+        bands.append("n_images")
     return bands
+
+
+def _include_n_images(cfg: dict) -> bool:
+    """Include the selected source-observation count for temporal composites."""
+    processing = cfg.get("processing") or {}
+    return bool((processing.get("temporal") or {}).get("aggregate"))
 
 
 def _include_n_valid(cfg: dict) -> bool:
@@ -370,6 +394,8 @@ def _output_descriptions(cfg: dict) -> dict[str, str]:
     descriptions.update(configured)
     if _include_n_valid(cfg):
         descriptions.setdefault("n_valid", N_VALID_DESCRIPTION)
+    if _include_n_images(cfg):
+        descriptions.setdefault("n_images", N_IMAGES_DESCRIPTION)
     if any(not isinstance(name, str) or not isinstance(text, str) or not text.strip()
            for name, text in descriptions.items()):
         raise ValueError("output descriptions must be non-empty strings")

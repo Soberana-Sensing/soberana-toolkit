@@ -1,12 +1,14 @@
 import numpy as np
+import pytest
 import xarray as xr
 
 from soberana_toolkit.serve.catalog import (
     discover_products,
+    find_scene_count_product,
     find_valid_count_product,
-    matching_valid_observation_slice,
+    matching_count_slice,
+    single_count_value,
     spatial_variables,
-    summarize_valid_observations,
 )
 
 
@@ -53,24 +55,32 @@ def test_find_valid_count_product_in_same_directory(tmp_path):
     assert find_valid_count_product(count_product) is None
 
 
-def test_summarize_valid_observations_ignores_nodata():
-    summary = summarize_valid_observations(np.array([[2, 4], [6, np.nan]]))
+def test_find_scene_count_product_in_same_directory(tmp_path):
+    product = tmp_path / "NDVI.nc"
+    count_product = tmp_path / "n_images.nc"
+    product.touch()
+    count_product.touch()
 
-    assert summary == (4.0, 2.0, 6.0)
-    assert summarize_valid_observations(np.array([np.nan])) is None
+    assert find_scene_count_product(product) == count_product
+    assert find_scene_count_product(count_product) is None
 
 
-def test_matching_valid_observation_slice_uses_the_selected_time():
+def test_matching_count_slice_uses_the_selected_time():
     times = np.array(["2024-01-01", "2024-02-01"], dtype="datetime64[ns]")
     dataset = xr.Dataset(
-        {"n_valid": (("t", "y", "x"), np.array([[[1, 2]], [[3, 4]]]))},
+        {"n_images": (("t", "y", "x"), np.array([[[1, 2]], [[3, 4]]]))},
         coords={"t": times, "y": [1], "x": [1, 2]},
     )
 
-    selected = matching_valid_observation_slice(dataset, times[1])
+    selected = matching_count_slice(dataset, "n_images", times[1])
 
     assert selected is not None
     np.testing.assert_array_equal(selected.values, [[3, 4]])
-    assert matching_valid_observation_slice(
-        dataset, np.datetime64("2024-03-01")
-    ) is None
+    assert matching_count_slice(dataset, "n_images", np.datetime64("2024-03-01")) is None
+
+
+def test_single_count_value_requires_spatially_constant_counts():
+    assert single_count_value(np.array([[4, 4], [4, np.nan]])) == 4.0
+    assert single_count_value(np.array([np.nan])) is None
+    with pytest.raises(ValueError, match="varies across pixels"):
+        single_count_value(np.array([[2, 4]]))

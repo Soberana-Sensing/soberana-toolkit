@@ -24,13 +24,21 @@ def find_valid_count_product(product: Path) -> Path | None:
     return count_product if count_product.is_file() else None
 
 
-def matching_valid_observation_slice(
-    dataset: xr.Dataset, time_value: object
+def find_scene_count_product(product: Path) -> Path | None:
+    """Find the sibling monthly source-observation count file."""
+    if product.name == "n_images.nc":
+        return None
+    count_product = product.with_name("n_images.nc")
+    return count_product if count_product.is_file() else None
+
+
+def matching_count_slice(
+    dataset: xr.Dataset, variable: str, time_value: object
 ) -> xr.DataArray | None:
-    """Load the n_valid raster matching one product timestamp, if present."""
-    if "n_valid" not in dataset.data_vars:
-        raise ValueError("valid-observation count file has no 'n_valid' data variable")
-    data = dataset["n_valid"]
+    """Load a count raster matching one product timestamp, if present."""
+    if variable not in dataset.data_vars:
+        raise ValueError(f"count file has no {variable!r} data variable")
+    data = dataset[variable]
     time_dim = next((name for name in ("t", "time") if name in data.dims), None)
     if time_dim is None:
         return None
@@ -42,13 +50,14 @@ def matching_valid_observation_slice(
     return data.isel({time_dim: int(matches[0])}).load()
 
 
-def summarize_valid_observations(values: np.ndarray) -> tuple[float, float, float] | None:
-    """Return median, minimum, and maximum finite valid-observation counts."""
-    finite_values = np.asarray(values)[np.isfinite(values)]
+def single_count_value(values: np.ndarray) -> float | None:
+    """Return a single finite count value; reject a spatially varying scene count."""
+    finite_values = np.unique(np.asarray(values)[np.isfinite(values)])
     if finite_values.size == 0:
         return None
-    median, minimum, maximum = np.median(finite_values), finite_values.min(), finite_values.max()
-    return float(median), float(minimum), float(maximum)
+    if finite_values.size != 1:
+        raise ValueError("monthly source-observation count varies across pixels")
+    return float(finite_values[0])
 
 
 def spatial_coordinates(data: xr.DataArray) -> tuple[str, str] | None:

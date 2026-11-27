@@ -10,11 +10,12 @@ import xarray as xr
 
 from soberana_toolkit.serve.catalog import (
     discover_products,
+    find_scene_count_product,
     find_valid_count_product,
-    matching_valid_observation_slice,
+    matching_count_slice,
+    single_count_value,
     spatial_coordinates,
     spatial_variables,
-    summarize_valid_observations,
 )
 
 st.set_page_config(page_title="Derived data browser", layout="wide")
@@ -73,12 +74,23 @@ with xr.open_dataset(selected_path, decode_coords="all") as dataset:
         time_label = time_labels[time_index]
 
     count_path = find_valid_count_product(selected_path)
-    count_summary = None
+    scene_count_path = find_scene_count_product(selected_path)
+    valid_count_data = None
+    scene_count = None
     if count_path is not None and selected_time is not None:
         with xr.open_dataset(count_path, decode_coords="all") as count_dataset:
-            count_data = matching_valid_observation_slice(count_dataset, selected_time)
-            if count_data is not None:
-                count_summary = summarize_valid_observations(count_data.values)
+            valid_count_data = matching_count_slice(
+                count_dataset, "n_valid", selected_time
+            )
+    if scene_count_path is not None and selected_time is not None:
+        with xr.open_dataset(scene_count_path, decode_coords="all") as count_dataset:
+            scene_count_data = matching_count_slice(
+                count_dataset, "n_images", selected_time
+            )
+            if scene_count_data is not None:
+                scene_count = single_count_value(scene_count_data.values)
+    elif selected_path.name == "n_images.nc" and selected_time is not None:
+        scene_count = single_count_value(data.values)
 
     extra_dims = [dim for dim in data.dims if dim not in (x_name, y_name)]
     for dim in extra_dims:
@@ -100,15 +112,11 @@ st.caption(f"{selected_path.relative_to(data_root)} · {time_label}")
 if description:
     with st.expander("Description"):
         st.text(description)
-if count_path is not None:
-    if count_summary is None:
-        st.warning(f"No matching valid-image count found for {time_label}.")
+if scene_count_path is not None or selected_path.name == "n_images.nc":
+    if scene_count is None:
+        st.warning(f"No matching monthly source-image count found for {time_label}.")
     else:
-        median_count, minimum_count, maximum_count = count_summary
-        st.info(
-            "Valid input images per pixel: "
-            f"median {median_count:g}; range {minimum_count:g}–{maximum_count:g}."
-        )
+        st.info(f"Source images selected for {time_label}: {scene_count:g}.")
 
 finite_values = values[np.isfinite(values)]
 if finite_values.size == 0:
@@ -142,6 +150,39 @@ figure.update_layout(
 )
 figure.update_yaxes(scaleanchor="x", scaleratio=1)
 st.plotly_chart(figure, width="stretch")
+
+if valid_count_data is not None:
+    count_axes = spatial_coordinates(valid_count_data)
+    if count_axes is None:
+        st.warning("The valid-observation count has no identifiable spatial coordinates.")
+    else:
+        count_x, count_y = count_axes
+        count_data = valid_count_data.transpose(count_y, count_x)
+        count_values = np.asarray(count_data.values)
+        if np.any(np.isfinite(count_values)):
+            count_figure = go.Figure(
+                go.Heatmap(
+                    x=count_data[count_x].values,
+                    y=count_data[count_y].values,
+                    z=count_values,
+                    colorscale="Viridis",
+                    colorbar={"title": "Valid images"},
+                    hovertemplate=(
+                        f"{count_x}=%{{x}}<br>{count_y}=%{{y}}"
+                        "<br>valid images=%{z}<extra></extra>"
+                    ),
+                )
+            )
+            count_figure.update_layout(
+                title=f"Valid input images per pixel — {time_label}",
+                xaxis_title=count_x,
+                yaxis_title=count_y,
+                margin={"l": 20, "r": 20, "t": 50, "b": 20},
+            )
+            count_figure.update_yaxes(scaleanchor="x", scaleratio=1)
+            st.plotly_chart(count_figure, width="stretch")
+        else:
+            st.warning(f"No valid-observation counts are available for {time_label}.")
 
 with st.expander("Metadata"):
     st.text(f"File: {selected_path}")
