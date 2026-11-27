@@ -12,6 +12,10 @@ from soberana_toolkit.serve.catalog import (
     single_count_value,
     spatial_variables,
 )
+from soberana_toolkit.serve.statistics import (
+    _histogram_edges,
+    fractional_class_statistics,
+)
 
 
 def test_discover_products_recursively_and_in_order(tmp_path):
@@ -112,3 +116,97 @@ def test_single_count_value_requires_spatially_constant_counts():
     assert single_count_value(np.array([np.nan])) is None
     with pytest.raises(ValueError, match="varies across pixels"):
         single_count_value(np.array([[2, 4]]))
+
+
+def test_fractional_class_statistics_use_soft_membership_weights():
+    times = np.array(["2024-01-01", "2024-02-01"], dtype="datetime64[ns]")
+    coords = {"t": times, "y": [1], "x": [1, 2]}
+    values = xr.DataArray(
+        [[[0.0, 10.0]], [[2.0, 8.0]]],
+        dims=("t", "y", "x"),
+        coords=coords,
+        name="NDVI",
+    )
+    fractions = {
+        "scl_water": xr.DataArray(
+            [[[0.25, 0.75]], [[0.5, 0.5]]],
+            dims=("t", "y", "x"),
+            coords=coords,
+            name="scl_water",
+        ),
+        "scl_soil": xr.DataArray(
+            [[[0.75, 0.25]], [[0.5, 0.5]]],
+            dims=("t", "y", "x"),
+            coords=coords,
+            name="scl_soil",
+        ),
+        "scl_vegetation": xr.DataArray(
+            np.zeros((2, 1, 2)),
+            dims=("t", "y", "x"),
+            coords=coords,
+            name="scl_vegetation",
+        ),
+    }
+
+    stats = fractional_class_statistics(values, fractions)
+
+    assert stats["classes"]["scl_water"]["medians"] == [7.5, 5.0]
+    assert stats["classes"]["scl_soil"]["medians"] == [2.5, 5.0]
+    assert stats["classes"]["scl_vegetation"]["medians"] == [None, None]
+    assert sum(stats["classes"]["scl_water"]["histograms"][0]["probability"]) == pytest.approx(1)
+
+    selected_month = fractional_class_statistics(values, fractions, time_index=1)
+    assert selected_month["times"] == ["2024-02-01"]
+    assert selected_month["classes"]["scl_water"]["medians"] == [5.0]
+    assert selected_month["classes"]["scl_water"]["histograms"][0] is not None
+
+    time_series = fractional_class_statistics(
+        values, fractions, include_histograms=False
+    )
+    assert time_series["classes"]["scl_water"]["medians"] == [7.5, 5.0]
+    assert time_series["classes"]["scl_water"]["histograms"] == [None, None]
+
+
+def test_fractional_histogram_groups_outliers_and_median_resists_them():
+    times = np.array(["2024-01-01"], dtype="datetime64[ns]")
+    coords = {"t": times, "y": [1], "x": np.arange(101)}
+    data = np.append(np.arange(100, dtype=float), 1e9).reshape(1, 1, 101)
+    values = xr.DataArray(data, dims=("t", "y", "x"), coords=coords, name="BSI")
+    fractions = xr.DataArray(
+        np.ones_like(data),
+        dims=("t", "y", "x"),
+        coords=coords,
+        name="scl_water",
+    )
+
+    stats = fractional_class_statistics(values, {"scl_water": fractions})
+    water = stats["classes"]["scl_water"]
+    histogram = water["histograms"][0]
+
+    assert water["medians"] == [50]
+    assert histogram["lower_tail_fraction"] == pytest.approx(1 / 101)
+    assert histogram["upper_tail_fraction"] == pytest.approx(1 / 101)
+    assert histogram["probability"][0] > 0
+    assert histogram["probability"][-1] > 0
+    assert sum(histogram["probability"]) == pytest.approx(1)
+
+
+def test_fractional_class_statistics_reject_values_outside_zero_to_one():
+    times = np.array(["2024-01-01"], dtype="datetime64[ns]")
+    values = xr.DataArray(
+        [[[1.0]]], dims=("t", "y", "x"), coords={"t": times, "y": [1], "x": [1]}
+    )
+    fraction = xr.DataArray(
+        [[[1.5]]], dims=("t", "y", "x"), coords={"t": times, "y": [1], "x": [1]}
+    )
+
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        fractional_class_statistics(values, {"scl_water": fraction})
+
+
+def test_histogram_bins_are_capped_before_allocation_for_outlier_heavy_values():
+    edges = _histogram_edges(np.array([0.0, 1e-9, 2e-9, 3e-9, 1e9]))
+
+    assert edges.size <= 51
+    assert edges[0] == 0
+    assert edges[-1] == 1e9

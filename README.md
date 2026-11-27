@@ -129,8 +129,16 @@ The browser groups `.nc` files under `data/derived/` by their parent dataset dir
 dataset (for example, `s2_l2a_monthly`) as the product, then choose a raster variable. It provides
 a time selector for time-series rasters; static rasters need no time selection. For temporal
 products, it shows the selected month's source-observation count and a map of valid observations
-per pixel when sibling `n_images.nc` and `n_valid.nc` files exist. It reads existing products; it
-does not run processing.
+per pixel when sibling `n_images.nc` and `n_valid.nc` files exist. It also shows a variable
+histogram for the selected month and a monthly time series split by water, soil, and vegetation
+SCL fractions. Pixels contribute fractionally to each class instead of being assigned a hard class.
+The time series uses fraction-weighted medians to reduce sensitivity to isolated extreme values.
+Histograms show the 1st-to-99th-percentile range, with more extreme values retained in the outer
+bins so they do not stretch the entire plot. Dataset discovery reads NetCDF metadata, not raster
+arrays. The map and histogram read the selected month's slices; the time series streams the
+selected variable and its SCL fractions month by month, then caches its medians. Changing month
+reuses that time series and computes only the selected month's histogram. It reads existing
+products; it does not run processing.
 
 ## Contributing
 
