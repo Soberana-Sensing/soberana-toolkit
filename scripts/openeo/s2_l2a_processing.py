@@ -1,0 +1,322 @@
+"""Build an openEO Sentinel-2 datacube from a YAML config.
+
+Usage:
+    python s2_l2a_processing.py cfg.yaml            # build, write process_graph.json
+    python s2_l2a_processing.py cfg.yaml --check    # also list processes the backend does not support
+    python s2_l2a_processing.py cfg.yaml --run      # build, run batch job, download results
+
+Pipeline order: load -> SCL mask -> scale -> reproject to aoi.crs -> resample/clip -> indices
+                -> temporal aggregation -> gap fill -> spatial window aggregation -> save
+
+Every layer and every output keeps aoi.crs; that CRS is also written to run_metadata.json.
+"""
+import ast
+import json
+import math
+import operator
+import sys
+from datetime import date, datetime, timedelta
+from functools import reduce
+from pathlib import Path
+ 
+import openeo
+import yaml
+ 
+# ---------------------------------------------------------------- allowed values (openEO spec)
+PERIODS = {"hour", "day", "week", "dekad", "month", "season", "tropical-season", "year", "decade", "decade-ad"}
+RESAMPLE_METHODS = {"near", "bilinear", "cubic", "cubicspline", "lanczos", "average", "mode",
+                    "max", "min", "med", "q1", "q3", "rms", "sum"}
+ALIGN = {"upper-left", "upper-right", "lower-left", "lower-right"}
+REDUCERS = {"mean", "median", "min", "max", "sum", "sd", "variance", "first", "last", "count", "product"}
+GAP_FILL = {"linear"}
+ 
+ 
+def _check(value, allowed, label):
+    if value not in allowed:
+        raise ValueError(f"{label}: '{value}' not valid. Use one of: {', '.join(sorted(allowed))}")
+ 
+ 
+# ---------------------------------------------------------------- formulas
+def _bm(x) -> bool:
+    """True if x is a cube still in openEO client 'band math mode' (result of .band() and arithmetic on it)."""
+    return getattr(x, "_in_bandmath_mode", lambda: False)()
+ 
+ 
+def _unary(x, bm_fn, pb_fn):
+    """Band-math-preserving op when possible (so it can be combined further), else a per-pixel apply()."""
+    return bm_fn(x) if _bm(x) else x.apply(pb_fn)
+ 
+ 
+def _safe_div(a, b):
+    """a / b, nodata where b == 0."""
+    if isinstance(b, (int, float)):
+        return a / b
+    return (a / b).mask((b == 0) * 1.0)
+ 
+ 
+BINOPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+          ast.Div: operator.truediv, ast.Pow: operator.pow}
+FUNCS = {  # name: (n_args, function)
+    "sqrt": (1, lambda x: _unary(x, lambda c: c ** 0.5, lambda v: v.sqrt())),
+    "abs": (1, lambda x: _unary(x, lambda c: (c ** 2) ** 0.5, lambda v: v.absolute())),
+    "ln": (1, lambda x: _unary(x, lambda c: c.ln(), lambda v: v.ln())),
+    "log10": (1, lambda x: _unary(x, lambda c: c.log10(), lambda v: v.log(10))),
+    "exp": (1, lambda x: _unary(x, lambda c: math.e ** c, lambda v: v.exp())),
+    "sqrt_clip": (1, lambda x: _unary(x, lambda c: ((c + (c ** 2) ** 0.5) / 2) ** 0.5,
+                                      lambda v: ((v + v.absolute()) / 2).sqrt())),  # sqrt(max(x, 0))
+    "safe_div": (2, _safe_div),
+}
+ 
+ 
+def eval_formula(expr: str, env: dict):
+    """Evaluate an index formula over single-band cubes. Whitelisted syntax only (no eval())."""
+ 
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return n.value
+        if isinstance(n, ast.Name):
+            if n.id not in env:
+                raise KeyError(f"Unknown name '{n.id}' in formula '{expr}'. Known: {sorted(env)}")
+            return env[n.id]
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, ast.USub):
+            return ev(n.operand) * -1
+        if isinstance(n, ast.BinOp) and type(n.op) in BINOPS:
+            return BINOPS[type(n.op)](ev(n.left), ev(n.right))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in FUNCS:
+            arity, fn = FUNCS[n.func.id]
+            if len(n.args) != arity:
+                raise ValueError(f"{n.func.id}() takes {arity} argument(s) in formula '{expr}'")
+            return fn(*[ev(a) for a in n.args])
+        raise ValueError(f"Unsupported syntax in formula '{expr}': {ast.dump(n)}")
+ 
+    return ev(ast.parse(expr, mode="eval"))
+ 
+ 
+# ---------------------------------------------------------------- masking
+def build_mask(cube, scl_cfg: dict):
+    """Return a mask cube (1 = masked) from the SCL band, or None if masking is off."""
+    if not scl_cfg:
+        return None
+    dil = scl_cfg.get("dilation")
+    if not dil:
+        raise KeyError("mask.scl.dilation is required; the plain class-list mask is no longer supported")
+    # CDSE to_scl_dilation_mask; input must be a cube with only SCL, output 1 = masked
+    scl_only = cube.filter_bands(["SCL"])
+    return scl_only.process("to_scl_dilation_mask", data=scl_only, **dil)
+
+
+# ---------------------------------------------------------------- spatial / temporal helpers
+def target_crs(aoi: dict):
+    """Target CRS for every layer and output. aoi.crs is the only place it is set."""
+    crs = aoi.get("crs")
+    if not crs:
+        raise KeyError("aoi.crs is required: the CRS the cube and every output layer must keep")
+    if isinstance(crs, str) and crs.upper().startswith("EPSG:"):
+        epsg = crs.split(":", 1)[1]
+        if not epsg.isdigit():
+            raise ValueError(f"aoi.crs '{crs}' is not a valid EPSG code")
+        return int(epsg)
+    return crs  # integer EPSG code or WKT string, passed to the backend as-is
+
+
+def get_aoi(aoi: dict):
+    """Return the AOI geometry. The AOI is always a GeoJSON file."""
+    if "geojson" not in aoi:
+        raise KeyError("aoi.geojson is required: the AOI is a GeoJSON file")
+    return json.loads(Path(aoi["geojson"]).read_text())
+
+
+def apply_spatial(cube, sp: dict, geojson, method_key: str, crs):
+    """Reproject to aoi.crs, optionally resample, then clip to the AOI polygon."""
+    rs = sp.get("resample") or {}
+    default_method = "bilinear" if method_key == "method" else "near"
+    method = rs.get(method_key, default_method)
+    _check(method, RESAMPLE_METHODS, f"spatial.resample.{method_key}")
+    align = rs.get("align", "upper-left")
+    _check(align, ALIGN, "spatial.resample.align")
+    cube = cube.resample_spatial(resolution=rs.get("resolution", 0), projection=crs,
+                                 method=method, align=align)
+    if sp.get("clip_to_aoi"):
+        cube = cube.mask_polygon(geojson)
+    return cube
+
+
+def temporal_aggregate(cube, agg: dict, reducer: str):
+    _check(reducer, REDUCERS, "temporal reducer")
+    if "intervals" in agg:  # takes precedence over period
+        labels = agg.get("labels")
+        if labels is not None and len(labels) != len(agg["intervals"]):
+            raise ValueError(f"temporal.aggregate.labels has {len(labels)} entries, "
+                             f"intervals has {len(agg['intervals'])}")
+        return cube.aggregate_temporal(intervals=agg["intervals"], reducer=reducer, labels=labels)
+    _check(agg["period"], PERIODS, "temporal.aggregate.period")
+    return cube.aggregate_temporal_period(period=agg["period"], reducer=reducer)
+ 
+ 
+# ---------------------------------------------------------------- build
+def build_cube(cfg: dict, conn, crs):
+    src, proc, out = cfg["source"], cfg.get("processing", {}), cfg["output"]
+    roles: dict = src["roles"]
+    spatial_cfg = proc.get("spatial", {}) or {}
+    temporal_cfg = proc.get("temporal", {}) or {}
+    end = (date.fromisoformat(str(src["time_end"])) + timedelta(days=1)).isoformat()
+    geojson = get_aoi(cfg["aoi"])
+
+    # 1. load only what is needed (+ SCL for masking)
+    codes = list(dict.fromkeys(roles.values()))
+    cube = conn.load_collection(
+        src["collection"],
+        spatial_extent=geojson,
+        temporal_extent=[str(src["time_start"]), end],
+        bands=codes + ["SCL"],
+        max_cloud_cover=src.get("max_cloud_cover"),
+    )
+
+    # 2. scale spectral bands (indices like SI1 expect reflectance); SCL stays untouched
+    scale = src.get("scale", 1.0)
+    spectral = cube.filter_bands(codes)
+    if scale != 1.0:
+        spectral = spectral.apply(lambda x: x * scale)
+
+    # 3. mask on the native grid (before any resampling)
+    mask = build_mask(cube, proc.get("mask", {}).get("scl", {}))
+    if mask is not None:
+        spectral = spectral.mask(mask)
+
+    # 4. spatial: always reproject to aoi.crs, then optional resample and clip
+    spectral = apply_spatial(spectral, spatial_cfg, geojson, "method", crs)
+
+    # 5. formula environment: role name -> single-band cube
+    env = {role: spectral.band(code) for role, code in roles.items()}
+    for name, spec in (cfg.get("indices") or {}).items():
+        env[name] = eval_formula(spec["formula"], env)
+
+    # 6. SCL class layers: 0/1 indicator per observation, masked like the bands; "mean" later = fraction
+    scl_layers = {}
+    scl_cube = cube.filter_bands(["SCL"])
+    for name, classes in (cfg.get("scl_classes") or {}).items():
+        if name in env:
+            raise KeyError(f"scl_classes name '{name}' clashes with a role/index")
+        classes = classes if isinstance(classes, list) else [classes]
+        ind = reduce(lambda a, b: a | b, [scl_cube == c for c in classes]) * 1.0
+        if mask is not None:
+            ind = ind.mask(mask)
+        ind = apply_spatial(ind, spatial_cfg, geojson, "scl_method", crs)
+        scl_layers[name] = ind.rename_labels("bands", [name])
+
+    # 7. assemble requested outputs as (name, cube) with a band dimension
+    parts = []
+    for name in out["bands"]:
+        if name in scl_layers:
+            parts.append((name, scl_layers[name]))
+        elif name in env:
+            parts.append((name, env[name].add_dimension("bands", name, type="bands")))  # .band() drops band dim
+        else:
+            raise KeyError(f"output.bands has unknown '{name}'. Known: {sorted(list(env) + list(scl_layers))}")
+
+    # 8. temporal aggregation (+ valid observation count) and gap fill
+    agg = temporal_cfg.get("aggregate")
+    if agg:
+        parts = [(n, temporal_aggregate(c, agg, "mean" if n in scl_layers else agg["reducer"])) for n, c in parts]
+        if out.get("n_valid"):
+            first = next(iter(roles.values()))
+            n = temporal_aggregate(spectral.band(first), agg, "count")
+            parts.append(("n_valid", n.add_dimension("bands", "n_valid", type="bands")))
+        gap_fill = temporal_cfg.get("gap_fill")
+        if gap_fill is not None:
+            _check(gap_fill, GAP_FILL, "temporal.gap_fill")
+            parts = [(n, c if n == "n_valid" else c.apply_dimension(dimension="t", process="array_interpolate_linear"))
+                     for n, c in parts]
+ 
+    # 9. spatial window aggregation (experimental in openEO)
+    win = spatial_cfg.get("aggregate_window")
+    if win:
+        _check(win.get("reducer", "mean"), REDUCERS, "spatial.aggregate_window.reducer")
+        parts = [(n, c.aggregate_spatial_window(reducer=win.get("reducer", "mean"), size=win["size"],
+                                                boundary=win.get("boundary", "pad"),
+                                                align=win.get("align", "upper-left")))
+                 for n, c in parts]
+ 
+    return reduce(lambda a, b: a.merge_cubes(b), [c for _, c in parts])
+ 
+ 
+# ---------------------------------------------------------------- run metadata
+def write_metadata(cfg: dict, out_dir: Path, crs, job_id=None) -> Path:
+    """Record what produced this output, including the CRS. The NetCDF carries its own CRS
+    from the backend grid; this file is the readable, diffable record next to it."""
+    proc = cfg.get("processing") or {}
+    meta = {
+        "name": cfg["name"],
+        "collection": cfg["source"]["collection"],
+        "provider": cfg["source"].get("provider"),
+        "citation": cfg["source"].get("citation"),
+        "crs": f"EPSG:{crs}" if isinstance(crs, int) else crs,
+        "time_start": str(cfg["source"]["time_start"]),
+        "time_end": str(cfg["source"]["time_end"]),
+        "aoi_geojson": cfg["aoi"]["geojson"],
+        "temporal": (proc.get("temporal") or {}).get("aggregate"),
+        "gap_fill": (proc.get("temporal") or {}).get("gap_fill"),
+        "bands": cfg["output"]["bands"],
+        "n_valid": bool(cfg["output"].get("n_valid")),
+        "format": cfg["output"].get("format", "NetCDF"),
+        "config": str(cfg.get("_path", "")) or None,
+        "generated": datetime.now().isoformat(timespec="seconds"),
+    }
+    if job_id:
+        meta["job_id"] = job_id
+    path = out_dir / "run_metadata.json"
+    path.write_text(json.dumps(meta, indent=2) + "\n")
+    return path
+
+
+# ---------------------------------------------------------------- backend check
+def used_processes(node) -> set:
+    found = set()
+    if isinstance(node, dict):
+        if "process_id" in node:
+            found.add(node["process_id"])
+        for v in node.values():
+            found |= used_processes(v)
+    elif isinstance(node, list):
+        for v in node:
+            found |= used_processes(v)
+    return found
+ 
+ 
+def main(path: str, run: bool, check: bool):
+    cfg = yaml.safe_load(Path(path).read_text())
+    cfg["_path"] = path
+    crs = target_crs(cfg["aoi"])
+    conn = openeo.connect(cfg["source"].get("backend_url", "openeo.dataspace.copernicus.eu")).authenticate_oidc()
+    cube = build_cube(cfg, conn, crs)
+    result = cube.save_result(format=cfg["output"].get("format", "NetCDF"), options=cfg["output"].get("options"))
+
+    out_dir = Path(cfg["output"].get("dir", "out"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    graph_json = result.to_json()
+    (out_dir / "process_graph.json").write_text(graph_json)
+    print(f"crs: {crs}")
+    print(f"process graph written to {out_dir / 'process_graph.json'}")
+
+    if check:
+        available = {p["id"] for p in conn.list_processes()}
+        missing = sorted(used_processes(json.loads(graph_json)) - available)
+        print("all processes supported by backend" if not missing else f"NOT supported by backend: {missing}")
+
+    job = None
+    if run:
+        job = result.create_job(title=cfg["name"], job_options=cfg["output"].get("job_options"))
+        job.start_and_wait()
+        job.get_results().download_files(out_dir)
+
+    meta_path = write_metadata(cfg, out_dir, crs, job_id=getattr(job, "job_id", None))
+    print(f"run metadata written to {meta_path}")
+ 
+ 
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    main(sys.argv[1], run="--run" in sys.argv, check="--check" in sys.argv)
+ 
