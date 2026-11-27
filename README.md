@@ -19,34 +19,41 @@ the project that needs it and imports from this toolkit.
 
 ## Status
 
-Early, as of 2026-11-27. The openEO Sentinel-2 pipeline builds a process graph from YAML, and
-`soberana_toolkit.verify` exists to check that produced NetCDF files sit on the grid they claim.
-Everything else is still layout. Code in `archive/` is earlier work kept on disk for reuse, is
+Early, as of 2026-11-27, but installable from a local checkout. The implemented pieces are the
+openEO Sentinel-2 pipeline, named-grid and NetCDF verification, and a local browser for derived
+NetCDF products. Cube assembly, analysis, ML, and API modules are not implemented yet; they are
+future layout, not package features. Code in `archive/` is earlier work kept on disk for reuse, is
 git-ignored, and is not part of the package.
+
+The package contains reusable code, not project data or configuration. Keep a project's
+`config/` and `data/` in that project, install this package into the project's environment, and
+run toolkit commands from the project root. Config and data paths are resolved relative to the
+current working directory unless a setting explicitly allows an override.
 
 ## Layout
 
+The toolkit repository contains reusable code and its tests:
+
 ```
-config/                    configuration files (YAML), no secrets
+src/soberana_toolkit/
+  grid.py                  load and validate named grids
+  verify.py                alignment gate for NetCDF products
+  openeo/                  openEO processing
+  serve/                   local browser for derived NetCDF products
+tests/                     tests
+```
+
+Each consuming project keeps its own inputs and outputs:
+
+```
+config/
   grids/                   named grids: CRS, pixel size, alignment policy
+  datasets/                dataset source, processing, and output configuration
 data/
   raw/                     data as delivered or downloaded
   interim/                 reshaped intermediates
   derived/                 analysis outputs
   aoi/                     area-of-interest GeoJSON, one per site
-  inventory/               catalogue of datasets in use, tracked by git
-src/soberana_toolkit/
-  grid.py                  load and validate named grids
-  verify.py                alignment gate for NetCDF products
-  openeo/                  backend connections, collections, process graphs (S1, S2, ...)
-  cube/                    cube assembly, merging, alignment, temporal and spatial reduction
-  io/                      readers and writers for NetCDF, Zarr, COG, GeoJSON
-  analysis/                indices, masking, statistics
-  ml/                      feature preparation, training, inference, evaluation
-  serve/                   web app and API layer
-scripts/                   thin command-line entry points over the library
-tests/                     tests
-notebooks/                 exploration; not a deliverable
 ```
 
 `config/` must never hold credentials. Keep secrets in the environment or in a local,
@@ -54,33 +61,35 @@ git-ignored file.
 
 ## Grids and alignment
 
-Every product must sit on a named grid from `config/grids/`. The grid is the only place a CRS or a
-pixel size is set; datatype configs name the grid and inherit the rest, so nothing can contradict
-it.
+Every product in a consuming project must sit on a named grid from its `config/grids/`. The grid
+is the only place a CRS or a pixel size is set; dataset configs name the grid and inherit the rest,
+so nothing can contradict it.
 
 `resolution_policy: native_or_grid` means the effective pixel size is the larger of the grid
 resolution and the source's native resolution. Data finer than the grid is coarsened onto it;
 data coarser than the grid keeps its native resolution. Pixel size never shrinks, so no product
 claims detail it does not have.
 
-The inventory at `data/inventory/datasets.yaml` declares what each dataset is, where it lives, its
-native resolution and the period it covers. The verifier reads that file and checks each product
-for CRS, pixel size against the policy, evenly spaced and monotonic axes, and a sane time axis:
+Each dataset configuration in the consuming project's `config/datasets/` names its grid and
+output directory. Set `source.native_resolution` there so the verifier can check the grid's
+resolution policy. Run these commands from the consuming project root, with the toolkit installed
+in that project's environment:
 
 ```sh
-./soberana-toolkit-venv/bin/python -m soberana_toolkit.verify
-./soberana-toolkit-venv/bin/python -m soberana_toolkit.verify --grid utm28_30m some.nc
+python -m soberana_toolkit.verify
+python -m soberana_toolkit.verify --dataset-config config/datasets/<dataset>.yaml
+python -m soberana_toolkit.verify --grid <grid-name> path/to/product.nc
 ```
 
 Output is a list of findings plus a count. Errors exit nonzero; warnings do not unless `--strict`.
 The pipeline writes the grid name and a hash of the grid file into `run_metadata.json`, so an
-output can always be traced to the definition that produced it.
+output can always be traced to the definition that produced it. The dataset YAML is the source
+of truth; there is no separate inventory to keep in sync.
 
 ## Data and dates
 
-Data lives under `data/` and is not tracked, but the folder tree is. Any description of a dataset
-carries its date: the acquisition window for imagery, the epoch for model output, the retrieval
-date for a catalogue record. A dataset with no date is a claim with no time.
+Consuming projects keep data under `data/`; large data files are not tracked. Any dataset config
+carries its acquisition window or epoch. A dataset with no date is a claim with no time.
 
 ## Working rules
 
@@ -101,6 +110,21 @@ python3.12 -m venv soberana-toolkit-venv
 Dependencies are declared in `pyproject.toml` only; there is no `requirements.txt`. A new
 dependency is added there, with a lower bound, at the moment the code that needs it is written.
 
+## Browsing derived products
+
+Install the optional serving dependencies in the consuming project's environment and run the app
+from the consuming project root:
+
+```sh
+python -m pip install -e "/path/to/soberana-toolkit[serve]"
+python -m streamlit run "/path/to/soberana-toolkit/src/soberana_toolkit/serve/app.py"
+```
+
+The browser lists `.nc` files anywhere under the consuming project's `data/derived/`, displays
+spatial variables, and provides a time selector for time-series rasters. Static rasters are shown
+without a time selector. It reads existing products; it does not run processing.
+
 ## Contributing
 
-`main` is protected. Changes arrive through a pull request and are merged there.
+`main` is protected. Changes arrive through a pull request and are merged there. GitHub Actions
+runs the test suite on every push and pull request.

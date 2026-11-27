@@ -23,6 +23,10 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
 ]
+serve = [
+    "plotly>=5.20",
+    "streamlit>=1.49",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,5 +1,0 @@
-name: utm28_30m
-crs: EPSG:32628
-resolution: 30
-resolution_policy: native_or_grid
-align: upper-left

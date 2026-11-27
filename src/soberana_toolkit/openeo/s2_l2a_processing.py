@@ -1,26 +1,32 @@
 """Build an openEO Sentinel-2 datacube from a YAML config.
 
 Usage:
-    python s2_l2a_processing.py cfg.yaml            # build, write process_graph.json
-    python s2_l2a_processing.py cfg.yaml --check    # also list processes the backend does not support
-    python s2_l2a_processing.py cfg.yaml --run      # build, run batch job, download results
+    python -m soberana_toolkit.openeo.s2_l2a_processing cfg.yaml
+    python -m soberana_toolkit.openeo.s2_l2a_processing cfg.yaml --check
+    python -m soberana_toolkit.openeo.s2_l2a_processing cfg.yaml --run
 
 Pipeline order: load -> SCL mask -> scale -> reproject to the grid -> resample/clip -> indices
                 -> temporal aggregation -> gap fill -> spatial window aggregation -> save
 
-CRS and resolution come from the named grid in config/grids/; the grid and its hash are
-recorded in run_metadata.json.
+Run from the consuming project root so project config, AOI, and output paths resolve correctly.
+When the output format is NetCDF, the downloaded result is split into one file per requested
+output band, named <band>.nc.
+CRS and resolution come from the named grid in the consuming project's config/grids/; the grid
+and its hash are recorded in run_metadata.json.
 """
 import ast
 import json
 import math
 import operator
 import sys
+import tempfile
 from datetime import date, datetime, timedelta
 from functools import reduce
 from pathlib import Path
  
 import openeo
+import rioxarray  # noqa: F401  (registers the .rio accessor)
+import xarray as xr
 import yaml
 
 from soberana_toolkit.grid import Grid, load_grid
@@ -280,6 +286,85 @@ def used_processes(node) -> set:
     return found
  
  
+def split_netcdf_by_band(
+    source: Path,
+    bands: list[str],
+    out_dir: Path,
+    crs: int | str,
+    descriptions: dict[str, str] | None = None,
+) -> list[Path]:
+    """Write one NetCDF per requested band from an openEO multi-band result."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    with xr.open_dataset(source) as ds:
+        if "bands" in ds.dims:
+            labels = [
+                value.decode() if isinstance(value, bytes) else str(value)
+                for value in ds["bands"].values
+            ]
+            missing = [band for band in bands if band not in labels]
+            if missing:
+                raise ValueError(f"{source}: requested bands not present: {missing}; found {labels}")
+            band_indices = {label: index for index, label in enumerate(labels)}
+        else:
+            missing = [band for band in bands if band not in ds.data_vars]
+            if missing:
+                raise ValueError(
+                    f"{source}: no 'bands' dimension and requested variables not present: "
+                    f"{missing}; found {list(ds.data_vars)}"
+                )
+            band_indices = None
+
+        for band in bands:
+            if not band or Path(band).name != band or band in {".", ".."}:
+                raise ValueError(f"invalid output band name for a filename: {band!r}")
+            selected = (
+                ds.isel(bands=band_indices[band], drop=True)
+                if band_indices is not None
+                else ds[[band]]
+            )
+            if "openEO" in selected.data_vars and band not in selected.data_vars:
+                selected = selected.rename({"openEO": band})
+            elif len(selected.data_vars) == 1 and band not in selected.data_vars:
+                selected = selected.rename({next(iter(selected.data_vars)): band})
+            if descriptions and band in descriptions:
+                if band not in selected.data_vars:
+                    raise ValueError(f"{source}: no data variable found for output band {band!r}")
+                selected[band].attrs["description"] = descriptions[band]
+                selected.attrs["description"] = descriptions[band]
+            selected = selected.rio.write_crs(crs, grid_mapping_name="crs")
+            for variable in selected.variables.values():
+                variable.encoding.pop("chunksizes", None)
+            path = out_dir / f"{band}.nc"
+            selected.to_netcdf(path)
+            paths.append(path)
+    return paths
+
+
+def _requested_output_bands(cfg: dict) -> list[str]:
+    bands = list(cfg["output"]["bands"])
+    processing = cfg.get("processing") or {}
+    if (processing.get("temporal") or {}).get("aggregate") and cfg["output"].get("n_valid"):
+        bands.append("n_valid")
+    return bands
+
+
+def _output_descriptions(cfg: dict) -> dict[str, str]:
+    descriptions = {
+        name: spec["description"]
+        for name, spec in (cfg.get("indices") or {}).items()
+        if spec.get("description")
+    }
+    configured = (cfg.get("output") or {}).get("descriptions") or {}
+    if not isinstance(configured, dict):
+        raise TypeError("output.descriptions must be a mapping of band names to descriptions")
+    descriptions.update(configured)
+    if any(not isinstance(name, str) or not isinstance(text, str) or not text.strip()
+           for name, text in descriptions.items()):
+        raise ValueError("output descriptions must be non-empty strings")
+    return descriptions
+
+
 def main(path: str, run: bool, check: bool):
     cfg = yaml.safe_load(Path(path).read_text())
     cfg["_path"] = path
@@ -304,7 +389,26 @@ def main(path: str, run: bool, check: bool):
     if run:
         job = result.create_job(title=cfg["name"], job_options=cfg["output"].get("job_options"))
         job.start_and_wait()
-        job.get_results().download_files(out_dir)
+        if str(cfg["output"].get("format", "NetCDF")).lower() == "netcdf":
+            with tempfile.TemporaryDirectory(prefix="s2-l2a-") as temp_dir:
+                downloaded = job.get_results().download_files(temp_dir)
+                netcdf_files = [file for file in downloaded if file.suffix.lower() == ".nc"]
+                if len(netcdf_files) != 1:
+                    raise ValueError(
+                        f"expected one NetCDF result to split, found {len(netcdf_files)}: "
+                        f"{netcdf_files}"
+                    )
+                outputs = split_netcdf_by_band(
+                    netcdf_files[0],
+                    _requested_output_bands(cfg),
+                    out_dir,
+                    grid.crs,
+                    _output_descriptions(cfg),
+                )
+            for output in outputs:
+                print(f"output written to {output}")
+        else:
+            job.get_results().download_files(out_dir)
 
     meta_path = write_metadata(cfg, out_dir, grid, job_id=getattr(job, "job_id", None))
     print(f"run metadata written to {meta_path}")
