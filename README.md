@@ -61,8 +61,17 @@ builds are out of scope. See `AGENTS.md` for the working agreement.
 
 ## Development
 
-A project virtual environment named `soberana-toolkit-venv` is created at the repository root
-when the first module needs dependencies. Nothing is installed into the system Python.
+The package is declared in `pyproject.toml` (setuptools, `src/` layout) and installed in editable
+mode into a local environment. Nothing is installed into the system Python.
+
+```sh
+python3.12 -m venv soberana-toolkit-venv
+./soberana-toolkit-venv/bin/python -m pip install -e ".[dev]"
+./soberana-toolkit-venv/bin/python -m pytest
+```
+
+Dependencies are declared in `pyproject.toml` only; there is no `requirements.txt`. A new
+dependency is added there, with a lower bound, at the moment the code that needs it is written.
 
 ## Contributing
 
