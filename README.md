@@ -2,8 +2,7 @@
 
 Reusable tooling for Soberana Sensing Earth-observation work.
 
-This is a shared library, not a single product. It holds the pieces we expect to use more than
-once: openEO helpers for Sentinel-1 and Sentinel-2, datacube assembly and merging, analysis and
+This is a shared library that holds the pieces we expect to use more than once: openEO helpers for Sentinel-1 and Sentinel-2, datacube assembly and merging, analysis and
 index calculations, machine-learning utilities, and a thin serving layer for turning a produced
 cube into a small web application.
 
@@ -20,20 +19,25 @@ the project that needs it and imports from this toolkit.
 
 ## Status
 
-Scaffolding only, as of 2026-11-27. Folders and conventions exist; most modules are empty. Code
-in `archive/` is earlier work that is kept on disk for reuse, is git-ignored, and is not part of
-the package.
+Early, as of 2026-11-27. The openEO Sentinel-2 pipeline builds a process graph from YAML, and
+`soberana_toolkit.verify` exists to check that produced NetCDF files sit on the grid they claim.
+Everything else is still layout. Code in `archive/` is earlier work kept on disk for reuse, is
+git-ignored, and is not part of the package.
 
 ## Layout
 
 ```
 config/                    configuration files (YAML), no secrets
+  grids/                   named grids: CRS, pixel size, alignment policy
 data/
   raw/                     data as delivered or downloaded
   interim/                 reshaped intermediates
   derived/                 analysis outputs
-  inventory/               catalogue records of what data exists, with dates
+  aoi/                     area-of-interest GeoJSON, one per site
+  inventory/               catalogue of datasets in use, tracked by git
 src/soberana_toolkit/
+  grid.py                  load and validate named grids
+  verify.py                alignment gate for NetCDF products
   openeo/                  backend connections, collections, process graphs (S1, S2, ...)
   cube/                    cube assembly, merging, alignment, temporal and spatial reduction
   io/                      readers and writers for NetCDF, Zarr, COG, GeoJSON
@@ -47,6 +51,30 @@ notebooks/                 exploration; not a deliverable
 
 `config/` must never hold credentials. Keep secrets in the environment or in a local,
 git-ignored file.
+
+## Grids and alignment
+
+Every product must sit on a named grid from `config/grids/`. The grid is the only place a CRS or a
+pixel size is set; datatype configs name the grid and inherit the rest, so nothing can contradict
+it.
+
+`resolution_policy: native_or_grid` means the effective pixel size is the larger of the grid
+resolution and the source's native resolution. Data finer than the grid is coarsened onto it;
+data coarser than the grid keeps its native resolution. Pixel size never shrinks, so no product
+claims detail it does not have.
+
+The inventory at `data/inventory/datasets.yaml` declares what each dataset is, where it lives, its
+native resolution and the period it covers. The verifier reads that file and checks each product
+for CRS, pixel size against the policy, evenly spaced and monotonic axes, and a sane time axis:
+
+```sh
+./soberana-toolkit-venv/bin/python -m soberana_toolkit.verify
+./soberana-toolkit-venv/bin/python -m soberana_toolkit.verify --grid utm28_30m some.nc
+```
+
+Output is a list of findings plus a count. Errors exit nonzero; warnings do not unless `--strict`.
+The pipeline writes the grid name and a hash of the grid file into `run_metadata.json`, so an
+output can always be traced to the definition that produced it.
 
 ## Data and dates
 
