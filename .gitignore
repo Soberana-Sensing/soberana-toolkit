@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+*-venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Local scratch and earlier work kept on disk only
+archive/
+
+# Agent notes stay local
+AGENTS.md
+
+# Data: keep the tree, ignore the contents
+data/raw/*
+data/interim/*
+data/derived/*
+data/inventory/*
+!data/.gitkeep
+!data/*/README.md
+!data/*/.gitkeep
+
+# Local config and credentials
+config/*.local.*
+config/secrets.*
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
