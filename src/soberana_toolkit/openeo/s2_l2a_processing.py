@@ -37,6 +37,9 @@ RESAMPLE_METHODS = {"near", "bilinear", "cubic", "cubicspline", "lanczos", "aver
                     "max", "min", "med", "q1", "q3", "rms", "sum"}
 REDUCERS = {"mean", "median", "min", "max", "sum", "sd", "variance", "first", "last", "count", "product"}
 GAP_FILL = {"linear"}
+N_VALID_DESCRIPTION = (
+    "Number of valid input observations contributing to the composite at each pixel."
+)
  
  
 def _check(value, allowed, label):
@@ -216,7 +219,7 @@ def build_cube(cfg: dict, conn, grid: Grid):
     agg = temporal_cfg.get("aggregate")
     if agg:
         parts = [(n, temporal_aggregate(c, agg, "mean" if n in scl_layers else agg["reducer"])) for n, c in parts]
-        if out.get("n_valid"):
+        if _include_n_valid(cfg):
             first = next(iter(roles.values()))
             n = temporal_aggregate(spectral.band(first), agg, "count")
             parts.append(("n_valid", n.add_dimension("bands", "n_valid", type="bands")))
@@ -260,7 +263,7 @@ def write_metadata(cfg: dict, out_dir: Path, grid: Grid, job_id=None) -> Path:
         "temporal": (proc.get("temporal") or {}).get("aggregate"),
         "gap_fill": (proc.get("temporal") or {}).get("gap_fill"),
         "bands": cfg["output"]["bands"],
-        "n_valid": bool(cfg["output"].get("n_valid")),
+        "n_valid": _include_n_valid(cfg),
         "format": cfg["output"].get("format", "NetCDF"),
         "config": str(cfg.get("_path", "")) or None,
         "generated": datetime.now().isoformat(timespec="seconds"),
@@ -343,10 +346,16 @@ def split_netcdf_by_band(
 
 def _requested_output_bands(cfg: dict) -> list[str]:
     bands = list(cfg["output"]["bands"])
-    processing = cfg.get("processing") or {}
-    if (processing.get("temporal") or {}).get("aggregate") and cfg["output"].get("n_valid"):
+    if _include_n_valid(cfg):
         bands.append("n_valid")
     return bands
+
+
+def _include_n_valid(cfg: dict) -> bool:
+    """Include per-pixel valid-observation counts by default for temporal composites."""
+    processing = cfg.get("processing") or {}
+    has_temporal_aggregate = bool((processing.get("temporal") or {}).get("aggregate"))
+    return has_temporal_aggregate and cfg["output"].get("n_valid", True)
 
 
 def _output_descriptions(cfg: dict) -> dict[str, str]:
@@ -359,6 +368,8 @@ def _output_descriptions(cfg: dict) -> dict[str, str]:
     if not isinstance(configured, dict):
         raise TypeError("output.descriptions must be a mapping of band names to descriptions")
     descriptions.update(configured)
+    if _include_n_valid(cfg):
+        descriptions.setdefault("n_valid", N_VALID_DESCRIPTION)
     if any(not isinstance(name, str) or not isinstance(text, str) or not text.strip()
            for name, text in descriptions.items()):
         raise ValueError("output descriptions must be non-empty strings")

@@ -86,6 +86,10 @@ The pipeline writes the grid name and a hash of the grid file into `run_metadata
 output can always be traced to the definition that produced it. The dataset YAML is the source
 of truth; there is no separate inventory to keep in sync.
 
+Temporal composites also produce `n_valid.nc` by default. It records the number of unmasked input
+observations contributing to each pixel in each composite period. Set `output.n_valid: false` to
+disable this output.
+
 ## Data and dates
 
 Consuming projects keep data under `data/`; large data files are not tracked. Any dataset config
@@ -122,7 +126,9 @@ python -m streamlit run "/path/to/soberana-toolkit/src/soberana_toolkit/serve/ap
 
 The browser lists `.nc` files anywhere under the consuming project's `data/derived/`, displays
 spatial variables, and provides a time selector for time-series rasters. Static rasters are shown
-without a time selector. It reads existing products; it does not run processing.
+without a time selector. When a sibling `n_valid.nc` exists, it also reports the median and range
+of valid input observations per pixel for the selected time. It reads existing products; it does
+not run processing.
 
 ## Contributing
 

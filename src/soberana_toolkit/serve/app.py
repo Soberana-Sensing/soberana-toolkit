@@ -10,8 +10,11 @@ import xarray as xr
 
 from soberana_toolkit.serve.catalog import (
     discover_products,
+    find_valid_count_product,
+    matching_valid_observation_slice,
     spatial_coordinates,
     spatial_variables,
+    summarize_valid_observations,
 )
 
 st.set_page_config(page_title="Derived data browser", layout="wide")
@@ -49,6 +52,7 @@ with xr.open_dataset(selected_path, decode_coords="all") as dataset:
 
     time_dim = next((name for name in ("t", "time") if name in data.dims), None)
     time_label = "Static raster"
+    selected_time = None
     if time_dim is not None:
         time_values = data[time_dim].values
         if len(time_values) == 0:
@@ -64,8 +68,17 @@ with xr.open_dataset(selected_path, decode_coords="all") as dataset:
                 options=list(range(len(time_values))),
                 format_func=lambda index: time_labels[index],
             )
+        selected_time = time_values[time_index]
         data = data.isel({time_dim: time_index})
         time_label = time_labels[time_index]
+
+    count_path = find_valid_count_product(selected_path)
+    count_summary = None
+    if count_path is not None and selected_time is not None:
+        with xr.open_dataset(count_path, decode_coords="all") as count_dataset:
+            count_data = matching_valid_observation_slice(count_dataset, selected_time)
+            if count_data is not None:
+                count_summary = summarize_valid_observations(count_data.values)
 
     extra_dims = [dim for dim in data.dims if dim not in (x_name, y_name)]
     for dim in extra_dims:
@@ -87,6 +100,15 @@ st.caption(f"{selected_path.relative_to(data_root)} · {time_label}")
 if description:
     with st.expander("Description"):
         st.text(description)
+if count_path is not None:
+    if count_summary is None:
+        st.warning(f"No matching valid-image count found for {time_label}.")
+    else:
+        median_count, minimum_count, maximum_count = count_summary
+        st.info(
+            "Valid input images per pixel: "
+            f"median {median_count:g}; range {minimum_count:g}–{maximum_count:g}."
+        )
 
 finite_values = values[np.isfinite(values)]
 if finite_values.size == 0:
