@@ -5,7 +5,7 @@ import xarray as xr
 from affine import Affine
 
 from soberana_toolkit.grid import load_grid
-from soberana_toolkit.verify import check_dataset, check_entry, verify_file
+from soberana_toolkit.verify import check_dataset, check_dataset_config, main, verify_file
 
 CRS = "EPSG:32628"
 
@@ -94,27 +94,71 @@ def test_check_dataset_detects_non_uniform_axis(grid, tmp_path):
     assert any(f.check == "axes" for f in levels(findings))
 
 
-def test_inventory_declarations_checked(tmp_path, grid, monkeypatch):
+def create_dataset_config(tmp_path, grid, output_dir="data/derived/s2"):
+    grid_dir = tmp_path / "config" / "grids"
+    grid_dir.mkdir(parents=True)
+    (grid_dir / "utm28_30m.yaml").write_text(grid.path.read_text())
+    config_dir = tmp_path / "config" / "datasets"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "s2.yaml"
+    config_path.write_text(
+        "name: s2\n"
+        "grid: utm28_30m\n"
+        "source:\n"
+        "  native_resolution: 10\n"
+        "output:\n"
+        f"  dir: {output_dir}\n"
+    )
+    return config_path
+
+
+def test_dataset_config_checks_each_netcdf(tmp_path, grid, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "config" / "grids").mkdir(parents=True)
-    (tmp_path / "config" / "grids" / "utm28_30m.yaml").write_text(grid.path.read_text())
+    config = create_dataset_config(tmp_path, grid)
+    output_dir = tmp_path / "data" / "derived" / "s2"
+    output_dir.mkdir(parents=True)
+    write_cube(output_dir / "NDVI.nc")
+    write_cube(output_dir / "SI1.nc", res=20)
 
-    entry = {
-        "name": "s2", "path": "data/derived/s2.nc", "role": "predictor",
-        "source": "SENTINEL2_L2A", "grid": "utm28_30m", "crs": "EPSG:32628",
-        "native_resolution": 10, "resolution": 30,
-        "acquisition": "2016-01-01/2025-12-31", "retrieved": "2026-11-27",
-    }
-    findings = check_entry(entry)
-    assert levels(findings) == []
-    assert any(f.check == "file" for f in findings)  # warnings only when the file is absent
+    findings = check_dataset_config(config)
 
-    bad = dict(entry, resolution=20)
-    assert any(f.check == "inventory" for f in levels(check_entry(bad)))
+    assert any(f.check == "pixel_size" and "SI1.nc" in f.message for f in levels(findings))
+    assert not any("NDVI.nc" in f.message for f in levels(findings))
 
 
-def test_inventory_entry_requires_dates(tmp_path, grid, monkeypatch):
+@pytest.mark.parametrize(
+    ("config_text", "missing_field"),
+    [
+        ("name: incomplete\noutput: {}\n", "grid"),
+        ("name: incomplete\ngrid: utm28_30m\noutput: {}\n", "source.native_resolution"),
+        (
+            (
+                "name: incomplete\ngrid: utm28_30m\n"
+                "source:\n  native_resolution: 10\noutput: {}\n"
+            ),
+            "output.dir",
+        ),
+    ],
+)
+def test_dataset_config_requires_verification_fields(
+    tmp_path, grid, monkeypatch, config_text, missing_field
+):
     monkeypatch.chdir(tmp_path)
-    finding = check_entry({"name": "x", "path": "p", "grid": "utm28_30m",
-                           "source": "s", "native_resolution": 10})
-    assert any(f.check == "inventory" and "acquisition" in f.message for f in finding)
+    config = create_dataset_config(tmp_path, grid)
+    config.write_text(config_text)
+
+    findings = check_dataset_config(config)
+
+    assert any(missing_field in f.message for f in findings)
+
+
+def test_cli_scans_dataset_configs_by_default(tmp_path, grid, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    config = create_dataset_config(tmp_path, grid)
+    (tmp_path / "data" / "derived" / "s2").mkdir(parents=True)
+
+    assert main([]) == 0
+    assert "no NetCDF files found" in capsys.readouterr().out
+
+    assert main(["--dataset-config", str(config)]) == 0
+    assert "no NetCDF files found" in capsys.readouterr().out

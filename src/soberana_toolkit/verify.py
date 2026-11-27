@@ -3,6 +3,18 @@
 A product is only usable once it proves it sits on the grid it claims: same CRS, same pixel
 size allowed by the grid policy, axis-aligned, and a sane time axis. This module never repairs
 anything; it reports, and the caller decides.
+
+Run from the repository root in the project environment:
+
+    python -m soberana_toolkit.verify
+
+    python -m soberana_toolkit.verify --dataset-config config/datasets/s2_l2a_monthly.yaml
+
+    python -m soberana_toolkit.verify --grid utm28_30m some.nc
+
+Without arguments, all YAML files in config/datasets/ are checked. Use --dataset-config to
+check a specific dataset config, or pass NetCDF files with --grid to check files directly.
+Do not run this file by path; package mode is required for its relative imports.
 """
 
 from __future__ import annotations
@@ -21,7 +33,7 @@ from pyproj import CRS
 
 from .grid import Grid, load_grid
 
-INVENTORY = Path("data/inventory/datasets.yaml")
+DATASET_CONFIG_DIR = Path("config/datasets")
 TIME_NAMES = ("t", "time")
 TOLERANCE = 1e-3  # relative, applied to pixel size
 
@@ -133,62 +145,97 @@ def verify_file(path: str | Path, grid: Grid, native_resolution: float | None = 
         return check_dataset(ds, grid, native_resolution, source=str(path))
 
 
-def load_inventory(path: str | Path = INVENTORY) -> list[dict]:
-    data = yaml.safe_load(Path(path).read_text()) or {}
-    entries = data.get("datasets") or []
-    if not isinstance(entries, list):
-        raise TypeError(f"{path}: 'datasets' must be a list")
-    return entries
+def load_dataset_configs(directory: str | Path = DATASET_CONFIG_DIR) -> list[Path]:
+    directory = Path(directory)
+    return sorted([*directory.glob("*.yaml"), *directory.glob("*.yml")])
 
 
-def check_entry(entry: dict, base: Path = Path(".")) -> list[Finding]:
-    """Check one inventory row: declarations first, then the file itself if present."""
-    name = entry.get("name", "<unnamed>")
-    findings: list[Finding] = []
-    for key in ("name", "path", "grid", "source", "native_resolution", "acquisition", "retrieved"):
-        if key not in entry:
-            findings.append(_error("inventory", f"{name}: missing field '{key}'"))
-    if findings:
-        return findings
-
-    grid = load_grid(entry["grid"])
-    declared_crs = CRS.from_user_input(entry["crs"]) if "crs" in entry else None
-    if declared_crs is not None and not declared_crs.equals(CRS.from_user_input(grid.crs)):
-        findings.append(_error("inventory", f"{name}: declared crs {entry['crs']} != grid {grid.crs_label}"))
-    expected = grid.expected_pixel_size(entry["native_resolution"])
-    if "resolution" in entry and abs(float(entry["resolution"]) - expected) > expected * TOLERANCE:
-        findings.append(_error(
-            "inventory", f"{name}: declared resolution {entry['resolution']} != expected {expected:g}"))
-
-    path = Path(entry["path"])
-    if not path.is_absolute():
-        path = base / path
+def verify_path(path: str | Path, grid: Grid, native_resolution: float,
+                dataset_name: str) -> list[Finding]:
+    """Verify one NetCDF file or every top-level NetCDF in an output directory."""
+    path = Path(path)
+    if path.is_dir():
+        files = sorted(path.glob("*.nc"))
+        if not files:
+            return [_warning("file", f"{dataset_name}: no NetCDF files found in {path}")]
+        return [
+            finding
+            for file in files
+            for finding in verify_file(file, grid, native_resolution)
+        ]
     if not path.is_file():
-        return findings + [_warning("file", f"{name}: {path} not present yet, declarations only")]
-    return findings + verify_file(path, grid, entry["native_resolution"])
+        return [_warning("file", f"{dataset_name}: output path {path} not present yet")]
+    return verify_file(path, grid, native_resolution)
+
+
+def check_dataset_config(path: str | Path) -> list[Finding]:
+    """Check products declared by one dataset configuration."""
+    path = Path(path)
+    data = yaml.safe_load(path.read_text()) or {}
+    if not isinstance(data, dict):
+        return [_error("dataset_config", f"{path}: expected a YAML mapping")]
+
+    name = data.get("name", path.stem)
+    grid_name = data.get("grid")
+    source = data.get("source")
+    output = data.get("output")
+    if not isinstance(grid_name, str) or not grid_name:
+        return [_error("dataset_config", f"{name}: missing or invalid field 'grid'")]
+    if not isinstance(source, dict):
+        return [_error("dataset_config", f"{name}: missing field 'source.native_resolution'")]
+    if source.get("native_resolution") is None:
+        return [_error("dataset_config", f"{name}: missing field 'source.native_resolution'")]
+    if not isinstance(output, dict):
+        return [_error("dataset_config", f"{name}: missing field 'output.dir'")]
+    output_dir = output.get("dir")
+    if not isinstance(output_dir, str) or not output_dir:
+        return [_error("dataset_config", f"{name}: missing or invalid field 'output.dir'")]
+
+    try:
+        native_resolution = float(source["native_resolution"])
+    except (TypeError, ValueError):
+        return [_error("dataset_config", f"{name}: source.native_resolution must be numeric")]
+    if native_resolution <= 0:
+        return [_error("dataset_config", f"{name}: source.native_resolution must be positive")]
+
+    grid = load_grid(grid_name)
+    return verify_path(output_dir, grid, native_resolution, str(name))
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="soberana-toolkit.verify", description=__doc__)
+    parser = argparse.ArgumentParser(
+        prog="soberana-toolkit.verify",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("files", nargs="*", help="NetCDF files to check")
     parser.add_argument("--grid", help="grid name for the files given on the command line")
-    parser.add_argument("--inventory", default=str(INVENTORY), help="inventory YAML to check")
+    parser.add_argument(
+        "--dataset-config",
+        action="append",
+        dest="dataset_configs",
+        help="dataset YAML to check; may be supplied more than once",
+    )
     parser.add_argument("--json", help="write the findings to this path")
     parser.add_argument("--strict", action="store_true", help="treat warnings as failures")
     args = parser.parse_args(argv)
 
     findings: list[Finding] = []
     if args.files:
+        if args.dataset_configs:
+            parser.error("--dataset-config cannot be combined with NetCDF files")
         if not args.grid:
             parser.error("--grid is required when files are given")
         grid = load_grid(args.grid)
         for f in args.files:
             findings.extend(verify_file(f, grid))
     else:
-        entries = load_inventory(args.inventory)
-        findings = [f for entry in entries for f in check_entry(entry)]
-        if not entries:
-            print(f"inventory {args.inventory} has no datasets")
+        if args.grid:
+            parser.error("--grid is only used when NetCDF files are given")
+        configs = args.dataset_configs or load_dataset_configs()
+        findings = [f for config in configs for f in check_dataset_config(config)]
+        if not configs:
+            print(f"no dataset YAML files found in {DATASET_CONFIG_DIR}")
             return 0
 
     for finding in findings:
